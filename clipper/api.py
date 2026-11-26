@@ -2,6 +2,7 @@
 multi-user mode only has to change how the user is identified."""
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -14,7 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -1004,12 +1005,32 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
     # -- interface ---------------------------------------------------------------
     web_dir = ROOT / "web"
     if web_dir.exists():
-        app.mount("/", StaticFiles(directory=str(web_dir), html=True), name="web")
+        @app.get("/", include_in_schema=False)
+        @app.get("/index.html", include_in_schema=False)
+        def index_page():
+            # The page links to its script and style with a version taken from their contents.
+            # A changed file therefore has a new address, and no browser can keep running old code.
+            html = (web_dir / "index.html").read_text(encoding="utf-8")
+            for asset in ("assets/app.js", "assets/app.css"):
+                digest = hashlib.sha256((web_dir / asset).read_bytes()).hexdigest()[:12]
+                html = html.replace(f"/{asset}\"", f"/{asset}?v={digest}\"")
+            return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
+
+        app.mount("/", NoCacheStatic(directory=str(web_dir), html=True), name="web")
 
     return app
 
 
 # -- helpers ---------------------------------------------------------------------
+
+class NoCacheStatic(StaticFiles):
+    """Static files that browsers must check again before reusing, so an update is never hidden
+    behind an old copy."""
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
