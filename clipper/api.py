@@ -28,7 +28,11 @@ from .config import ROOT, Settings, load_settings
 from .db import dumps, loads, new_id, now_iso, today
 import httpx
 
-from .branding import LOGO_MAX_BYTES, MOMENTS_MAX, check_logo_file, logo_key
+from .branding import (
+    BUMPER_EXTENSIONS, BUMPER_KINDS, BUMPER_MAX_BYTES, BUMPER_MAX_SECONDS, LOGO_MAX_BYTES, MOMENTS_MAX,
+    bumper_key, check_logo_file, logo_key,
+)
+from .copy import load_copies
 from .llm import PRESETS
 from .media import ORIENTATIONS, RESOLUTIONS, MediaError
 from .pipeline import handlers as pipeline_handlers
@@ -54,6 +58,9 @@ USER_SETTING_DEFAULTS = {
     "default_orientation": "landscape",
     "default_resolution": "1080p",
     "default_moments_per_clip": 1,
+    "default_moments_min": 1,
+    "default_intro_on": False,
+    "default_outro_on": False,
     "default_logo_on": False,
     "default_logo_opacity": 80,
     "default_logo_size": 15,
@@ -81,8 +88,15 @@ class GenerateBody(BaseModel):
     captions_style: str = "classic"
     orientation: str = "landscape"
     resolution: str = "1080p"
-    moments_per_clip: int = Field(default=1, ge=1, le=MOMENTS_MAX)  # 1 = single moments
+    moments_per_clip: int = Field(default=1, ge=1, le=MOMENTS_MAX)  # most moments in a clip; 1 = single
+    moments_min: Optional[int] = Field(default=None, ge=1, le=MOMENTS_MAX)  # fewest; unset = same as most
     logo: Optional[LogoBody] = None
+    intro: bool = False
+    outro: bool = False
+
+
+class CopySelectBody(BaseModel):
+    index: int = Field(ge=0)
 
 
 class ClipSettingsBody(BaseModel):
@@ -423,6 +437,67 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
                 (user["id"], key, dumps(value)),
             )
         return get_settings(user, s)
+
+    # -- intro and outro -----------------------------------------------------------
+    @app.get("/api/branding")
+    def get_branding(user: dict = user_dep, s: Services = svc_dep) -> dict:
+        return {"branding": _branding_view(s, user["id"])}
+
+    @app.post("/api/branding/{kind}", status_code=201)
+    def upload_bumper(kind: str, file: UploadFile = File(...), user: dict = user_dep, s: Services = svc_dep) -> dict:
+        if kind not in BUMPER_KINDS:
+            raise HTTPException(404, "Not found")
+        if s.ffmpeg is None:
+            raise HTTPException(503, "FFmpeg is not available on this server")
+        ext = Path(file.filename or "").suffix.lower()
+        if ext not in BUMPER_EXTENSIONS:
+            raise HTTPException(400, "Use an MP4, MOV, WEBM or MKV video")
+        work = settings.work_dir / f"{kind}-{new_id()}"
+        work.mkdir(parents=True, exist_ok=True)
+        try:
+            staged = work / f"upload{ext}"
+            size = 0
+            with staged.open("wb") as fh:
+                while True:
+                    chunk = file.file.read(1 << 20)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > BUMPER_MAX_BYTES:
+                        raise HTTPException(413, "The video must be 200 MB or smaller")
+                    fh.write(chunk)
+            try:
+                check_upload_header(staged, ext)
+            except SecurityError as exc:
+                raise HTTPException(400, str(exc))
+            try:
+                info = s.ffmpeg.probe(staged)
+            except MediaError:
+                raise HTTPException(400, "That file could not be read as a video")
+            if info["duration"] < 1:
+                raise HTTPException(400, "The video is too short")
+            if info["duration"] > BUMPER_MAX_SECONDS:
+                raise HTTPException(400, f"The {kind} must be {BUMPER_MAX_SECONDS} seconds or shorter")
+            if not info["has_audio"]:
+                raise HTTPException(400, f"The {kind} needs a sound track, so it joins smoothly onto the clips")
+            s.storage.put_file(bumper_key(user["id"], kind), staged)
+            meta = _branding_meta(s, user["id"])
+            meta[kind] = {"name": safe_filename(file.filename or kind)[:120],
+                          "duration": round(info["duration"], 1), "uploaded_at": now_iso()}
+            _save_branding_meta(s, user["id"], meta)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        return {"branding": _branding_view(s, user["id"])}
+
+    @app.delete("/api/branding/{kind}")
+    def delete_bumper(kind: str, user: dict = user_dep, s: Services = svc_dep) -> dict:
+        if kind not in BUMPER_KINDS:
+            raise HTTPException(404, "Not found")
+        s.storage.delete(bumper_key(user["id"], kind))
+        meta = _branding_meta(s, user["id"])
+        meta.pop(kind, None)
+        _save_branding_meta(s, user["id"], meta)
+        return {"branding": _branding_view(s, user["id"])}
 
     # -- brand logo ----------------------------------------------------------------
     @app.get("/api/logo")
@@ -886,6 +961,35 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
         s.queue.enqueue(user["id"], project["id"], "render", {"clip_id": clip_id})
         return {"queued": True, "clip_id": clip_id}
 
+    @app.post("/api/clips/{clip_id}/copy/regenerate")
+    def regenerate_copy(clip_id: str, user: dict = user_dep, s: Services = svc_dep) -> dict:
+        """A new title and description. Earlier versions are kept, and the new one is made active."""
+        clip = _clip_owned(s, clip_id, user)
+        transcript = s.db.one("SELECT segments_json FROM transcripts WHERE project_id = ?", (clip["project_id"],))
+        if transcript is None:
+            raise HTTPException(409, "There is no transcript for this video")
+        from .copy import clip_transcript, write_copy
+
+        text = clip_transcript(loads(transcript["segments_json"], []),
+                               clip_parts(clip["start_sec"], clip["end_sec"], clip.get("segments_json")))
+        data = load_copies(clip.get("texts_json"))
+        new = write_copy(text, s.llm_providers(user["id"]), variant=len(data["versions"]))
+        data["versions"].append({**new, "created_at": now_iso()})
+        data["active"] = len(data["versions"]) - 1
+        s.db.run("UPDATE clips SET texts_json = ?, updated_at = ? WHERE id = ?", (dumps(data), now_iso(), clip_id))
+        return _clip_copy_view(data)
+
+    @app.post("/api/clips/{clip_id}/copy/select")
+    def select_copy(clip_id: str, body: CopySelectBody, user: dict = user_dep, s: Services = svc_dep) -> dict:
+        """Choose which saved title and description the clip uses. Nothing is deleted."""
+        clip = _clip_owned(s, clip_id, user)
+        data = load_copies(clip.get("texts_json"))
+        if body.index >= len(data["versions"]):
+            raise HTTPException(400, "There is no version with that number")
+        data["active"] = body.index
+        s.db.run("UPDATE clips SET texts_json = ?, updated_at = ? WHERE id = ?", (dumps(data), now_iso(), clip_id))
+        return _clip_copy_view(data)
+
     @app.get("/api/projects/{project_id}/zip")
     def project_zip(project_id: str, user: dict = project_media_dep, s: Services = svc_dep):
         project = _owned(s, "projects", project_id, user)
@@ -1172,6 +1276,10 @@ def _validate_setting(key: str, value, svc: Services) -> None:
         raise HTTPException(400, "Unknown resolution")
     if key == "default_moments_per_clip" and (not isinstance(value, int) or not 1 <= value <= MOMENTS_MAX):
         raise HTTPException(400, f"Moments per clip must be between 1 and {MOMENTS_MAX}")
+    if key == "default_moments_min" and (not isinstance(value, int) or not 1 <= value <= MOMENTS_MAX):
+        raise HTTPException(400, f"Moments per clip must be between 1 and {MOMENTS_MAX}")
+    if key in ("default_intro_on", "default_outro_on") and not isinstance(value, bool):
+        raise HTTPException(400, "The intro and outro settings must be on or off")
     if key == "default_logo_on" and not isinstance(value, bool):
         raise HTTPException(400, "The logo setting must be on or off")
     bounds = {"default_logo_opacity": (0, 100), "default_logo_size": (5, 50),
@@ -1271,6 +1379,35 @@ def _media_link(svc: Services, user_id: str, ref: str, path: str) -> str:
     return f"{path}?t={issue_media_token(svc.settings, user_id, ref)}"
 
 
+def _branding_meta(svc: Services, user_id: str) -> dict:
+    row = svc.db.one("SELECT value FROM settings WHERE user_id = ? AND key = 'branding_meta'", (user_id,))
+    return loads(row["value"], {}) if row else {}
+
+
+def _save_branding_meta(svc: Services, user_id: str, meta: dict) -> None:
+    svc.db.run(
+        "INSERT INTO settings (user_id, key, value) VALUES (?, 'branding_meta', ?) "
+        "ON CONFLICT (user_id, key) DO UPDATE SET value = excluded.value",
+        (user_id, dumps(meta)),
+    )
+
+
+def _branding_view(svc: Services, user_id: str) -> dict:
+    """The intro and outro that are uploaded. A kind is None when its file is missing."""
+    meta = _branding_meta(svc, user_id)
+    out = {}
+    for kind in BUMPER_KINDS:
+        exists = svc.storage.exists(bumper_key(user_id, kind))
+        out[kind] = (meta.get(kind) or {"name": kind}) if exists else None
+    return out
+
+
+def _clip_copy_view(data: dict) -> dict:
+    current = data["versions"][data["active"]] if data["versions"] else {"title": "", "description": ""}
+    return {"title": current.get("title", ""), "description": current.get("description", ""),
+            "copy_source": current.get("source"), "copies": data["versions"], "active_copy": data["active"]}
+
+
 def _logo_meta(svc: Services, user_id: str) -> Optional[dict]:
     """The uploaded logo's name and date, or None when there is no logo."""
     if not svc.storage.exists(logo_key(user_id)):
@@ -1294,6 +1431,7 @@ def _clip_rows(svc: Services, project_id: str) -> list[dict]:
             "score": r["score"], "reason": r["reason"], "status": r["status"], "error": r["error"],
             "provider_used": r["provider_used"], "settings": loads(r["settings_json"], {}),
             "effects": loads(r["effects_json"], []), "views": r["views"], "likes": r["likes"],
+            **_clip_copy_view(load_copies(r.get("texts_json"))),
             "video_url": _media_link(svc, owner, f"clip:{r['id']}", f"/api/clips/{r['id']}/video") if r["status"] == "done" else None,
             "download_url": _media_link(svc, owner, f"clip:{r['id']}", f"/api/clips/{r['id']}/download") if r["status"] == "done" else None,
         })
@@ -1322,6 +1460,8 @@ def _project_view(svc: Services, row: dict, with_clips: bool = True) -> dict:
         "orientation": row["orientation"],
         "resolution": row["resolution"],
         "moments_per_clip": row.get("moments_per_clip") or 1,
+        "moments_min": row.get("moments_min") or 1,
+        "extras": loads(row.get("extras_json"), None) or {"intro": False, "outro": False},
         "logo": loads(row.get("logo_json"), None),
         "transcription_engine": row["transcription_engine"],
         "provider_used": row["provider_used"],

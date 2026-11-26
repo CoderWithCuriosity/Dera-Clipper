@@ -7,7 +7,8 @@ import pytest
 from conftest import wait_for
 from clipper import media
 from clipper.branding import check_logo_file, clean_logo
-from clipper.planner import Moment, group_highlights
+from clipper.copy import heuristic_copy, load_copies, write_copy
+from clipper.planner import Moment, draw_sizes, group_highlights
 
 
 def _run(ffmpeg_bin, *args) -> bytes:
@@ -62,7 +63,7 @@ def test_logo_upload_must_be_a_real_image():
 def test_group_highlights_deals_ranked_moments_and_keeps_video_order():
     moments = [_moment(0, 5, 0.9), _moment(10, 15, 0.8), _moment(20, 25, 0.7),
                _moment(30, 35, 0.6), _moment(40, 45, 0.5), _moment(50, 55, 0.4)]
-    groups = group_highlights(moments, per_clip=3, clip_count=2)
+    groups = group_highlights(moments, [3, 3])
     assert len(groups) == 2 and all(len(g) == 3 for g in groups)
     # Each clip gets a mix: the two best moments land in different clips.
     assert {m.start for g in groups for m in g[:1]} == {0, 10}
@@ -73,9 +74,9 @@ def test_group_highlights_deals_ranked_moments_and_keeps_video_order():
 
 def test_group_highlights_makes_fewer_clips_when_moments_run_short():
     moments = [_moment(0, 5, 0.9), _moment(10, 15, 0.8), _moment(20, 25, 0.7), _moment(30, 35, 0.6)]
-    groups = group_highlights(moments, per_clip=3, clip_count=5)
+    groups = group_highlights(moments, [3, 3, 3, 3, 3])
     assert len(groups) == 1 and len(groups[0]) == 3  # one clip from the best three moments
-    assert group_highlights([], per_clip=3, clip_count=2) == []
+    assert group_highlights([], [3, 3]) == []
 
 
 def test_mixed_captions_are_moved_onto_the_joined_timeline():
@@ -206,7 +207,104 @@ def test_generation_rejects_bad_mix_and_missing_logo(client, sample_video):
     assert client.post(f"/api/projects/{pid}/generate", json={**base, "moments_per_clip": 9}).status_code == 422
 
     too_short = client.post(f"/api/projects/{pid}/generate", json={**base, "clip_length": 6, "moments_per_clip": 3})
-    assert too_short.status_code == 400 and "at least" in too_short.json()["detail"]
+    assert too_short.status_code == 400 and "shorter than" in too_short.json()["detail"]
 
     no_logo = client.post(f"/api/projects/{pid}/generate", json={**base, "logo": {"enabled": True}})
     assert no_logo.status_code == 400 and "Upload your logo" in no_logo.json()["detail"]
+
+
+def test_random_sizes_stay_in_range_and_zero_is_refused():
+    sizes = draw_sizes(2, 4, 50)
+    assert len(sizes) == 50 and all(2 <= n <= 4 for n in sizes)
+    assert draw_sizes(3, 3, 2) == [3, 3]
+    for bad in [(0, 2, 3), (3, 2, 3), (2, 3, 0)]:
+        with pytest.raises(ValueError):
+            draw_sizes(*bad)
+
+
+def test_grouping_gives_each_clip_its_own_size_and_never_empty_clips():
+    moments = [_moment(i * 10, i * 10 + 5, 1 - i / 10) for i in range(6)]
+    groups = group_highlights(moments, [1, 4, 2])  # 7 wanted, 6 found: the last clip is left out
+    assert [len(g) for g in groups] == [1, 4]
+    assert all(len(g) >= 1 for g in groups)
+    with pytest.raises(ValueError):
+        group_highlights(moments, [2, 0])
+
+
+def test_copy_falls_back_to_the_clips_own_words_and_keeps_history():
+    text = "This is the funny part. Nobody expected the ending! Then everything broke."
+    first = heuristic_copy(text, 0)
+    second = heuristic_copy(text, 1)
+    assert first["title"].startswith("This is the funny part") and first["source"] == "heuristic"
+    assert second["title"].startswith("Nobody expected")
+    assert write_copy("", [], 0)["title"] == "Clip"  # an empty transcript never produces an empty title
+    data = load_copies('{"versions": [{"title": "A"}, {"title": "B"}], "active": 0}')
+    assert [v["title"] for v in data["versions"]] == ["A", "B"] and data["active"] == 0
+    assert load_copies(None) == {"versions": [], "active": 0}
+
+
+def _short_video(ffmpeg_bin, path, seconds=3):
+    _run(ffmpeg_bin, "-y", "-f", "lavfi", "-i", f"testsrc=size=320x240:rate=25:duration={seconds}",
+         "-f", "lavfi", "-i", f"sine=frequency=660:duration={seconds}", "-c:v", "libx264",
+         "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(path))
+    return path
+
+
+def test_random_moment_counts_and_title_history(client, ffmpeg_bin, sample_video):
+    pid = _upload_video(client, sample_video)
+    res = client.post(f"/api/projects/{pid}/generate", json={
+        "theme": "Funny", "clip_length": 20, "clip_count": 3, "moments_per_clip": 4, "moments_min": 2,
+    })
+    assert res.status_code == 202, res.text
+    done = wait_for(client, f"/api/projects/{pid}", lambda p: p["status"] in ("done", "failed"))
+    assert done["status"] == "done", done
+    for clip in done["clips"]:
+        assert 2 <= clip["moments"] <= 4
+        assert clip["title"] and len(clip["copies"]) == 1 and clip["active_copy"] == 0
+
+    clip_id = done["clips"][0]["id"]
+    first_title = done["clips"][0]["title"]
+    again = client.post(f"/api/clips/{clip_id}/copy/regenerate")
+    assert again.status_code == 200, again.text
+    body = again.json()
+    assert len(body["copies"]) == 2 and body["copies"][0]["title"] == first_title
+    assert body["active_copy"] == 1
+    kept = client.post(f"/api/clips/{clip_id}/copy/select", json={"index": 0})
+    assert kept.status_code == 200 and kept.json()["title"] == first_title
+    assert client.post(f"/api/clips/{clip_id}/copy/select", json={"index": 9}).status_code == 400
+
+
+def test_guards_refuse_zero_and_impossible_moment_settings(client, sample_video):
+    pid = _upload_video(client, sample_video)
+    base = {"theme": "Funny", "clip_length": 15, "clip_count": 2}
+    assert client.post(f"/api/projects/{pid}/generate", json={**base, "moments_per_clip": 0}).status_code == 422
+    assert client.post(f"/api/projects/{pid}/generate", json={**base, "clip_count": 0}).status_code == 422
+    fewest_over = client.post(f"/api/projects/{pid}/generate", json={**base, "moments_per_clip": 2, "moments_min": 3})
+    assert fewest_over.status_code == 400 and "fewest" in fewest_over.json()["detail"]
+    one_mix = client.post(f"/api/projects/{pid}/generate", json={**base, "moments_per_clip": 3, "moments_min": 1})
+    assert one_mix.status_code == 400 and "at least 2" in one_mix.json()["detail"]
+    no_intro = client.post(f"/api/projects/{pid}/generate", json={**base, "intro": True})
+    assert no_intro.status_code == 400 and "intro" in no_intro.json()["detail"]
+
+
+def test_intro_is_joined_before_each_clip(client, ffmpeg_bin, sample_video, tmp_path):
+    intro = _short_video(ffmpeg_bin, tmp_path / "intro.mp4", seconds=3)
+    with open(intro, "rb") as fh:
+        res = client.post("/api/branding/intro", files={"file": ("intro.mp4", fh, "video/mp4")})
+    assert res.status_code == 201, res.text
+    assert res.json()["branding"]["intro"]["duration"] == 3.0
+    assert client.post("/api/branding/credits", files={"file": ("x.mp4", b"x", "video/mp4")}).status_code == 404
+
+    pid = _upload_video(client, sample_video)
+    res = client.post(f"/api/projects/{pid}/generate", json={
+        "theme": "Funny", "clip_length": 8, "clip_count": 1, "intro": True,
+    })
+    assert res.status_code == 202, res.text
+    done = wait_for(client, f"/api/projects/{pid}", lambda p: p["status"] in ("done", "failed"))
+    clip = done["clips"][0]
+    assert clip["status"] == "done", clip
+    assert clip["settings"]["bumpers"]["intro"] is True
+    video = client.get(clip["download_url"])
+    assert video.status_code == 200 and len(video.content) > 1000
+    removed = client.delete("/api/branding/intro")
+    assert removed.status_code == 200 and removed.json()["branding"]["intro"] is None

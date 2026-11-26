@@ -462,3 +462,24 @@ main.container:has(> .auth-shell) { max-width: none; padding: 0; }
 .range-row label { display: flex; justify-content: space-between; gap: 8px; font-size: 0.85rem; font-weight: 600; }
 .range-row output { color: var(--muted); font-weight: 500; }
 .range-row input[type="range"] { width: 100%; accent-color: var(--primary); margin: 0; }
+
+/* -- collapsible sections ----------------------------------------------------------- */
+details.fold > summary { list-style: none; cursor: pointer; }
+details.fold > summary::-webkit-details-marker { display: none; }
+details.fold > summary::after {
+  content: ""; flex: none; width: 9px; height: 9px; margin-left: 10px;
+  border-right: 2px solid var(--muted); border-bottom: 2px solid var(--muted);
+  transform: rotate(45deg); transition: transform .18s ease;
+}
+details.fold[open] > summary::after { transform: rotate(-135deg); }
+details.fold > summary.fold-head { display: flex; align-items: center; justify-content: space-between; }
+details.fold:not(.card) > summary { display: flex; align-items: center; justify-content: space-between; font-weight: 700; padding: 6px 0; }
+details.fold > summary:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; border-radius: 8px; }
+
+/* -- titles and descriptions -------------------------------------------------------- */
+.copy-block { display: grid; gap: 6px; }
+.copy-title { margin: 0; font-size: 1.02rem; overflow-wrap: anywhere; }
+.copy-tools { display: grid; gap: 10px; margin-top: 10px; }
+.copy-history { list-style: none; padding: 0; margin: 0; display: grid; gap: 10px; }
+.copy-history li { display: flex; gap: 12px; justify-content: space-between; align-items: flex-start; padding: 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.copy-history li.on { border-color: var(--primary); background: var(--primary-soft); }

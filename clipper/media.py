@@ -252,6 +252,8 @@ class Ffmpeg:
         captions: Optional[str] = None,
         has_audio: bool = True,
         logo: Optional[Logo] = None,
+        intro: Optional[Path] = None,
+        outro: Optional[Path] = None,
     ) -> Path:
         """Join several moments from one video into one clip, in the order given. Each moment
         is cut and framed first, the parts are joined without re-encoding, and the joined clip
@@ -266,21 +268,34 @@ class Ffmpeg:
         if mirror:
             frame += ",hflip"
 
+        # Every part uses the same frame rate, sample rate and channels, so they join without re-encoding.
+        common = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-r", "30"]
+        audio_out = ["-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2"]
+
+        def encode(name: str, source_args: list[str], duration: float, vf: str, audio: bool) -> Path:
+            part = parts_dir / name
+            args = [*source_args, "-map", "0:v:0", "-vf", vf, *common]
+            args += ["-map", "0:a:0?", *audio_out] if audio else ["-an"]
+            args += [str(part)]
+            self._check(self._run(args, cwd=parts_dir, timeout=max(600, int(duration * 20))), "Part rendering")
+            return part
+
         parts: list[Path] = []
         total = 0.0
+        if intro is not None:
+            length = self.probe(intro)["duration"]
+            parts.append(encode("intro.mp4", ["-i", str(intro)], length, frame, has_audio))
+            total += length
         for n, (start, end) in enumerate(ranges):
             duration = max(0.1, end - start)
-            part = parts_dir / f"part_{n:02d}.mp4"
-            args = ["-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", str(src), "-map", "0:v:0", "-vf", frame,
-                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"]
-            if has_audio:
-                args += ["-map", "0:a:0?", "-c:a", "aac", "-b:a", "160k"]
-            else:
-                args += ["-an"]
-            args += [str(part)]
-            self._check(self._run(args, cwd=parts_dir, timeout=max(600, int(duration * 20))), "Moment cutting")
-            parts.append(part)
+            parts.append(encode(f"part_{n:02d}.mp4",
+                                ["-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", str(src)],
+                                duration, frame, has_audio))
             total += duration
+        if outro is not None:
+            length = self.probe(outro)["duration"]
+            parts.append(encode("outro.mp4", ["-i", str(outro)], length, frame, has_audio))
+            total += length
 
         listing = parts_dir / "parts.txt"
         listing.write_text("".join(f"file '{p.name}'\n" for p in parts), encoding="utf-8")
@@ -370,6 +385,7 @@ def build_mix_captions_ass(
     width: int,
     height: int,
     style: str = "classic",
+    lead: float = 0.0,
 ) -> Optional[str]:
     """Captions for one or more moments joined into one clip. Each range is a moment in the
     source video. Its captions are moved onto the joined timeline, one moment after another."""
@@ -377,7 +393,7 @@ def build_mix_captions_ass(
         style = "classic"
     karaoke = style == "karaoke" and bool(words)
     lines: list[tuple[float, float, str]] = []
-    offset = 0.0
+    offset = lead  # seconds of intro that come before the first moment
     for clip_start, clip_end in ranges:
         for a, b, text in _caption_lines(segments, words, clip_start, clip_end, karaoke):
             a_in = min(max(a, clip_start), clip_end)

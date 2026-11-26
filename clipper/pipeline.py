@@ -13,7 +13,7 @@ import httpx
 
 from .db import dumps, loads, new_id, now_iso
 from .media import MediaError, frame_size
-from .planner import HEURISTIC, clip_parts, group_highlights, plan_moments
+from .planner import HEURISTIC, clip_parts, draw_sizes, group_highlights, plan_moments
 from .security import SecurityError, check_upload_header, is_platform_link, validate_link
 from .services import Services
 from .transcription import Transcript, TranscriptionError
@@ -273,12 +273,16 @@ def handle_plan(svc: Services, job: dict) -> None:
 
     # Mixed highlights: each clip joins several moments, so the planner finds per_clip times as
     # many moments, each one a share of the requested clip length. Single clips use the plain path.
-    per_clip = max(1, int(p.get("moments_per_clip") or 1))
-    mixed = per_clip > 1
+    # Each mixed clip gets a random number of moments between the fewest and the most chosen.
+    most = max(1, int(p.get("moments_per_clip") or 1))
+    fewest = min(most, max(1, int(p.get("moments_min") or 1)))
+    mixed = most > 1
     if mixed:
-        moment_length, wanted = p["clip_length"] / per_clip, p["clip_count"] * per_clip
+        sizes = draw_sizes(fewest, most, p["clip_count"])
+        moment_length, wanted = p["clip_length"] / ((fewest + most) / 2), sum(sizes)
         catalog: list[dict] = []  # sound effects and B-roll are added to single-moment clips only
     else:
+        sizes = [1] * p["clip_count"]
         moment_length, wanted = p["clip_length"], p["clip_count"]
         catalog = _effects_catalog(svc, p)
 
@@ -288,7 +292,7 @@ def handle_plan(svc: Services, job: dict) -> None:
     )
     if not moments:
         raise MediaError("No clip moments could be found in this video")
-    groups = group_highlights(moments, per_clip, p["clip_count"]) if mixed else [[m] for m in moments]
+    groups = group_highlights(moments, sizes) if mixed else [[m] for m in moments]
 
     from .effects import finalize_placements
 
@@ -302,10 +306,12 @@ def handle_plan(svc: Services, job: dict) -> None:
             m.effects = []
 
     svc.db.run("DELETE FROM clips WHERE project_id = ?", (pid,))
+    extras = loads(p.get("extras_json"), None) or {}
     settings_snapshot = dumps({
         "captions_style": p["captions_style"], "orientation": p["orientation"],
         "resolution": p["resolution"], "mirror": bool(p["mirror"]),
         "logo": loads(p.get("logo_json"), None),
+        "bumpers": {"intro": bool(extras.get("intro")), "outro": bool(extras.get("outro"))},
     })
     now = now_iso()
     clip_ids: list[str] = []
@@ -317,12 +323,21 @@ def handle_plan(svc: Services, job: dict) -> None:
         reason = first.reason if len(group) == 1 else " · ".join(m.reason for m in group if m.reason)[:1000]
         score = sum(m.score for m in group) / len(group)
         segments_json = dumps([[m.start, m.end] for m in group]) if mixed else None
+        # A first title and description, from the model or from the clip's own words. Later
+        # versions are added by the regenerate action and never replace this one.
+        from .copy import clip_transcript, write_copy
+
+        copy = write_copy(
+            clip_transcript(transcript.segments, [(m.start, m.end) for m in group]), providers, 0,
+            on_usage=usage, on_failure=failure,
+        )
+        texts_json = dumps({"versions": [copy], "active": 0})
         statements.append((
             "INSERT INTO clips (id, project_id, idx, start_sec, end_sec, score, reason, status, provider_used, "
-            "settings_json, effects_json, segments_json, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
+            "settings_json, effects_json, segments_json, texts_json, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)",
             (clip_id, pid, idx, min(m.start for m in group), max(m.end for m in group), round(score, 3),
-             reason, used, settings_snapshot, dumps(first.effects), segments_json, now, now),
+             reason, used, settings_snapshot, dumps(first.effects), segments_json, texts_json, now, now),
         ))
     svc.db.run_many(statements)
     message = f"Rendering {len(clip_ids)} clips"
@@ -362,21 +377,28 @@ def handle_render(svc: Services, job: dict) -> None:
         width, height = frame_size(orientation, resolution)
         parts = clip_parts(clip["start_sec"], clip["end_sec"], clip.get("segments_json"))
         transcript = _load_transcript(svc, pid)
+        # An intro or outro is joined on, so such a clip takes the joined path too.
+        bumpers = opts.get("bumpers") or {}
+        intro = _resolve_bumper(svc, p["user_id"], "intro") if bumpers.get("intro") else None
+        outro = _resolve_bumper(svc, p["user_id"], "outro") if bumpers.get("outro") else None
+        lead = ff.probe(intro)["duration"] if intro is not None else 0.0
         style = opts.get("captions_style", "classic")
         captions = None
         if style != "off" and transcript is not None:
             from .media import build_mix_captions_ass
 
-            captions = build_mix_captions_ass(transcript.segments, transcript.words, parts, width, height, style)
+            captions = build_mix_captions_ass(transcript.segments, transcript.words, parts, width, height, style,
+                                              lead=lead)
         local = svc.storage.local_path(p["source_key"])
         has_audio = ff.probe(local)["has_audio"]
         logo = _resolve_logo(svc, p["user_id"], opts.get("logo"))
         out = work / "clip.mp4"
         work.mkdir(parents=True, exist_ok=True)
-        if len(parts) > 1:
+        if len(parts) > 1 or intro is not None or outro is not None:
             ff.render_mix(
                 local, out, parts, work_dir=work, orientation=orientation, resolution=resolution,
                 mirror=bool(opts.get("mirror")), captions=captions, has_audio=has_audio, logo=logo,
+                intro=intro, outro=outro,
             )
         else:
             from .media import Effect
@@ -407,6 +429,16 @@ def handle_render(svc: Services, job: dict) -> None:
     finally:
         shutil.rmtree(work, ignore_errors=True)
         _update_project_progress(svc, pid)
+
+
+def _resolve_bumper(svc: Services, user_id: str, kind: str):
+    """The intro or outro file for this user, or None when none is uploaded."""
+    from .branding import bumper_key
+
+    key = bumper_key(user_id, kind)
+    if not svc.storage.exists(key):
+        return None
+    return svc.storage.local_path(key)
 
 
 def _resolve_logo(svc: Services, user_id: str, saved: Optional[dict]):

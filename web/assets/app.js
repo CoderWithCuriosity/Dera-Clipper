@@ -487,7 +487,7 @@
       // Only the progress card changes while the project works. The whole page is redrawn only
       // when the status, the clips, or the errors change, so the form never flickers.
       const sig = [project.status, project.has_transcript, project.theme, project.error || "",
-        (project.clips || []).map((c) => `${c.id}:${c.status}:${c.error || ""}`).join(",")].join("|");
+        (project.clips || []).map((c) => `${c.id}:${c.status}:${c.error || ""}:${c.active_copy}:${c.title}:${(c.copies || []).length}`).join(",")].join("|");
       if (lastSig !== null && sig === lastSig) {
         const box = document.getElementById("statusBox");
         if (box) box.innerHTML = statusHtml(project);
@@ -496,7 +496,7 @@
         return;
       }
       lastSig = sig;
-      const [themes, s, logoRes] = await Promise.all([api("/themes"), api("/settings"), api("/logo")]);
+      const [themes, s, logoRes, brandRes] = await Promise.all([api("/themes"), api("/settings"), api("/logo"), api("/branding")]);
       const v = s.values;
       const cur = {
         theme: project.theme || v.default_theme,
@@ -508,22 +508,25 @@
         mirror: project.theme ? project.mirror : v.default_mirror,
         effects: project.effects_enabled !== false,
         mix: project.theme ? project.moments_per_clip : v.default_moments_per_clip,
+        mix_min: project.theme ? project.moments_min : v.default_moments_min,
       };
+      const extrasCfg = project.theme && project.extras ? project.extras : { intro: v.default_intro_on, outro: v.default_outro_on };
       const logoCfg = project.theme && project.logo ? project.logo : {
         enabled: v.default_logo_on, opacity: v.default_logo_opacity, size: v.default_logo_size,
         x: v.default_logo_x, y: v.default_logo_y,
       };
       const done = (project.clips || []).filter((c) => c.status === "done").length;
       const settingsForm = project.has_transcript ? `
-        <form id="genForm" class="card stack">
-          <div class="card-head"><div class="row"><div class="bubble">${icon("sliders")}</div>
-            <div><h2>Clip settings</h2><div class="desc">Choose how the clips should look and sound.</div></div></div></div>
+        <details class="card fold" open>
+        <summary class="card-head fold-head"><div class="row"><div class="bubble">${icon("sliders")}</div>
+            <div><h2>Clip settings</h2><div class="desc">Choose how the clips should look and sound.</div></div></div></summary>
+        <form id="genForm" class="stack">
           <div class="field-grid">
             <div><label for="theme">Theme</label><select id="theme">${themes.themes.map((t) => `<option ${t === cur.theme ? "selected" : ""}>${esc(t)}</option>`).join("")}</select></div>
             <div><label for="clip_length">Clip length (seconds)</label><input id="clip_length" type="number" min="1" step="1" max="${Math.floor(project.duration)}" value="${esc(Math.round(cur.clip_length))}" required>
               <p class="field-hint">Up to ${fmtDuration(project.duration)}</p></div>
             <div><label for="clip_count">Number of clips</label><input id="clip_count" type="number" min="1" max="20" value="${esc(cur.clip_count)}" required></div>
-            ${mixBlock("g", cur.mix)}
+            ${mixBlock("g", cur.mix, cur.mix_min)}
             <div><label for="orientation">Orientation</label><select id="orientation">
               ${[["landscape", "Landscape 16:9"], ["vertical", "Vertical 9:16"], ["square", "Square 1:1"]]
                 .map(([val, lab]) => `<option value="${val}" ${val === cur.orientation ? "selected" : ""}>${esc(lab)}</option>`).join("")}</select></div>
@@ -539,11 +542,12 @@
             <label class="check"><input id="effects" type="checkbox" ${cur.effects ? "checked" : ""}> Add sound effects and B-roll</label>
           </div>
           ${logoBlock("g", logoCfg, logoRes.logo, "#orientation")}
+          ${bumperChecks("g", extrasCfg, brandRes.branding)}
           <div class="row">
             <button type="submit">${icon("sparkle")} ${project.clips && project.clips.length ? "Regenerate clips" : "Generate clips"}</button>
             <span class="small muted">The first available language model picks the moments. Without one, speech density picks them.</span>
           </div>
-        </form>` : "";
+        </form></details>` : "";
 
       const clips = (project.clips || []).map((c) => `
         <article class="card clip">
@@ -556,19 +560,35 @@
               <div class="row" style="gap:8px"><strong>Clip ${c.idx}</strong><span class="tag">${c.moments > 1 ? `Mix of ${c.moments} moments · ${fmtDuration(c.length)}` : `${fmtDuration(c.start)} to ${fmtDuration(c.end)}`}</span></div>
               ${c.score != null ? `<span class="tag score">Score ${c.score.toFixed(2)}</span>` : ""}
             </div>
+            <div class="copy-block">
+              <h3 class="copy-title">${esc(c.title || "Untitled clip")}</h3>
+              <p class="small">${esc(c.description || "")}</p>
+              <details class="fold"><summary>Title and description · ${(c.copies || []).length} saved ${(c.copies || []).length === 1 ? "version" : "versions"}</summary>
+                <div class="copy-tools">
+                  <div><button class="secondary sm" data-copy-regen="${esc(c.id)}">${icon("refresh")} Write a new one</button>
+                    <span class="small muted">Earlier versions are kept.</span></div>
+                  <ol class="copy-history">${(c.copies || []).map((v, i) => `
+                    <li class="${i === c.active_copy ? "on" : ""}"><div><strong>${esc(v.title)}</strong>
+                      <div class="small">${esc(v.description || "")}</div>
+                      <div class="tiny muted">${i === c.active_copy ? "In use" : `Version ${i + 1}`}${v.source ? ` · ${esc(v.source)}` : ""}</div></div>
+                      ${i === c.active_copy ? "" : `<button class="secondary sm" data-copy-select="${esc(c.id)}" data-index="${i}">Use this</button>`}</li>`).join("")}
+                  </ol>
+                </div>
+              </details>
+            </div>
             <p class="clip-reason small">${esc(c.reason || "")}</p>
             ${(c.effects || []).length ? `<div class="clip-facts">${c.effects.map((e) => `<span class="tag accent">${esc(e.effect_id.split("/").slice(-1)[0])} at ${Math.round(e.at)} s</span>`).join("")}</div>` : ""}
             ${c.error ? `<div class="notice error">${icon("alert")}<span>${esc(c.error)}</span></div>` : ""}
             <div class="row">
               ${c.download_url ? `<a class="btn sm" href="${esc(c.download_url)}">${icon("download")} Download</a>` : ""}
             </div>
-            ${c.status === "done" ? `
+            ${c.status === "done" ? `<details class="fold"><summary>Results</summary>
             <div class="metrics">
               <div><label for="v_${esc(c.id)}">Views</label><input id="v_${esc(c.id)}" data-views="${esc(c.id)}" type="number" min="0" value="${esc(c.views == null ? "" : c.views)}"></div>
               <div><label for="l_${esc(c.id)}">Likes</label><input id="l_${esc(c.id)}" data-likes="${esc(c.id)}" type="number" min="0" value="${esc(c.likes == null ? "" : c.likes)}"></div>
               <button class="secondary sm" data-save-metrics="${esc(c.id)}">${icon("check")} Save results</button>
-            </div>` : ""}
-            ${c.status !== "pending" && c.status !== "rendering" ? `
+            </div></details>` : ""}
+            ${c.status !== "pending" && c.status !== "rendering" ? `<details class="fold"><summary>Tools</summary>
             <div class="clip-tools">
               <div class="row">
                 <select data-r-caps="${esc(c.id)}" aria-label="Captions">${optionList(CAPTION_OPTIONS, (c.settings || {}).captions_style)}</select>
@@ -576,7 +596,7 @@
                 <label class="check"><input type="checkbox" data-r-mirror="${esc(c.id)}" ${(c.settings || {}).mirror ? "checked" : ""}> Mirror</label>
               </div>
               <div><button class="secondary sm" data-regen="${esc(c.id)}">${icon("refresh")} Regenerate this clip</button></div>
-            </div>` : ""}
+            </div></details>` : ""}
           </div>
         </article>`).join("");
 
@@ -609,7 +629,9 @@
               captions_style: document.getElementById("captions_style").value,
               orientation: document.getElementById("orientation").value,
               resolution: document.getElementById("resolution").value,
-              moments_per_clip: readMix("g"),
+              ...readMix("g"),
+              intro: document.getElementById("g_intro").checked,
+              outro: document.getElementById("g_outro").checked,
               logo: readLogo("g"),
             }});
             toast("Generation started");
@@ -627,6 +649,21 @@
         try { await api(`/projects/${encodeURIComponent(id)}`, { method: "DELETE" }); location.hash = "#/projects"; }
         catch (err) { toast(err.message); }
       });
+      app.querySelectorAll("[data-copy-regen]").forEach((btn) => btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        btn.textContent = "Writing...";
+        try {
+          await api(`/clips/${encodeURIComponent(btn.dataset.copyRegen)}/copy/regenerate`, { method: "POST" });
+          toast("New version written. Earlier versions are kept.");
+          render();
+        } catch (err) { toast(err.message); btn.disabled = false; btn.textContent = "Write a new one"; }
+      }));
+      app.querySelectorAll("[data-copy-select]").forEach((btn) => btn.addEventListener("click", async () => {
+        try {
+          await api(`/clips/${encodeURIComponent(btn.dataset.copySelect)}/copy/select`, { method: "POST", json: { index: Number(btn.dataset.index) } });
+          render();
+        } catch (err) { toast(err.message); }
+      }));
       app.querySelectorAll("[data-regen]").forEach((btn) => btn.addEventListener("click", async () => {
         const cid = btn.dataset.regen;
         const body = {
@@ -770,15 +807,22 @@
   }
 
   // Single moments (the normal clips) or mixed highlights (several moments joined per clip).
-  function mixBlock(p, perClip) {
-    const mixing = Number(perClip) > 1;
+  // Single moments, or mixed highlights where each clip gets a random number of moments from
+  // the fewest to the most. Equal values give a fixed count.
+  function mixBlock(p, most, fewest) {
+    const mixing = Number(most) > 1;
+    const hi = mixing ? Number(most) : 4;
+    const lo = mixing ? Number(fewest || most) : 2;
     return `
       <div><label for="${p}_mode">Clip style</label><select id="${p}_mode">
         <option value="single" ${mixing ? "" : "selected"}>Single moments</option>
         <option value="mix" ${mixing ? "selected" : ""}>Mixed highlights</option></select></div>
-      <div id="${p}_permwrap" ${mixing ? "" : "hidden"}><label for="${p}_per">Moments per clip</label>
-        <input type="number" id="${p}_per" min="2" max="6" step="1" value="${mixing ? Number(perClip) : 3}">
-        <p class="field-hint">Each clip joins this many moments, in the order they happen in the video. Sound effects and B-roll are added to single-moment clips only.</p></div>`;
+      <div id="${p}_permwrap" ${mixing ? "" : "hidden"}>
+        <div class="field-grid" style="gap:12px">
+          <div><label for="${p}_min">Fewest moments</label><input type="number" id="${p}_min" min="2" max="6" step="1" value="${lo}"></div>
+          <div><label for="${p}_per">Most moments</label><input type="number" id="${p}_per" min="2" max="6" step="1" value="${hi}"></div>
+        </div>
+        <p class="field-hint">Each clip gets a random number of moments between the fewest and the most. Set both to the same number for a fixed count. Sound effects and B-roll are added to single-moment clips only.</p></div>`;
   }
 
   function wireMix(p) {
@@ -788,9 +832,24 @@
     sync();
   }
 
+  // Checked here as well as on the server, so a zero or an impossible range is explained at once.
   function readMix(p) {
-    if (document.getElementById(p + "_mode").value !== "mix") return 1;
-    return Number(document.getElementById(p + "_per").value) || 3;
+    if (document.getElementById(p + "_mode").value !== "mix") return { moments_per_clip: 1, moments_min: 1 };
+    const most = Number(document.getElementById(p + "_per").value);
+    const fewest = Number(document.getElementById(p + "_min").value);
+    if (!Number.isInteger(most) || most < 2 || most > 6) throw new Error("Most moments must be a whole number from 2 to 6");
+    if (!Number.isInteger(fewest) || fewest < 2 || fewest > 6) throw new Error("Fewest moments must be a whole number from 2 to 6");
+    if (fewest > most) throw new Error("Fewest moments cannot be more than most moments");
+    return { moments_per_clip: most, moments_min: fewest };
+  }
+
+  // Intro and outro tick boxes. A box is only usable once the matching video is uploaded.
+  function bumperChecks(p, cfg, branding) {
+    const box = (kind, label) => {
+      const have = !!(branding && branding[kind]);
+      return `<label class="check"><input type="checkbox" id="${p}_${kind}" ${cfg[kind] && have ? "checked" : ""} ${have ? "" : "disabled"}> ${label}${have ? "" : ` <span class="small muted">(upload in Setup)</span>`}</label>`;
+    };
+    return `<div class="toggle-row">${box("intro", "Add intro")}${box("outro", "Add outro")}</div>`;
   }
 
   function optionList(options, selected) {
@@ -830,8 +889,8 @@
     const token = routeId;  // a newer page has replaced this one if this changes
     setNav("batches");
     stopPolling();
-    const [batch, s, themes, logoRes] = await Promise.all([
-      api("/batches/" + encodeURIComponent(id)), api("/settings"), api("/themes"), api("/logo"),
+    const [batch, s, themes, logoRes, brandRes] = await Promise.all([
+      api("/batches/" + encodeURIComponent(id)), api("/settings"), api("/themes"), api("/logo"), api("/branding"),
     ]);
     if (token !== routeId) return;
     const cur = batch.settings || {};
@@ -855,8 +914,9 @@
           <label class="check"><input id="b_rights" type="checkbox"> I own these videos or have permission to process them.</label>
           <div class="row"><button id="addBtn">Add to batch</button><span id="addStatus" class="small muted"></span></div>
         </section>
-        <form id="batchSettingsForm" class="card stack">
-          <div class="card-head"><div class="row"><div class="bubble">${icon("sliders")}</div><div><h2>Settings for every video</h2><div class="desc">Saved for this batch and applied to each video.</div></div></div></div>
+        <details class="card fold" open>
+          <summary class="card-head fold-head"><div class="row"><div class="bubble">${icon("sliders")}</div><div><h2>Settings for every video</h2><div class="desc">Saved for this batch and applied to each video.</div></div></div></summary>
+      <form id="batchSettingsForm" class="stack">
           <div class="field-grid">
             <div><label for="bs_theme">Theme</label><select id="bs_theme">${themes.themes.map((t) => `<option ${t === (cur.theme || v.default_theme) ? "selected" : ""}>${esc(t)}</option>`).join("")}</select></div>
             <div><label for="bs_len">Clip length (seconds)</label><input id="bs_len" type="number" min="1" value="${esc(cur.clip_length || v.default_clip_length)}" required></div>
@@ -866,16 +926,17 @@
               <option value="1080p" ${(cur.resolution || v.default_resolution) === "1080p" ? "selected" : ""}>1080p</option>
               <option value="720p" ${(cur.resolution || v.default_resolution) === "720p" ? "selected" : ""}>720p</option></select></div>
             <div><label for="bs_caps">Captions</label><select id="bs_caps">${optionList(CAPTION_OPTIONS, cur.captions_style || v.default_captions_style)}</select></div>
-            ${mixBlock("bs", cur.moments_per_clip || v.default_moments_per_clip)}
+            ${mixBlock("bs", cur.moments_per_clip || v.default_moments_per_clip, cur.moments_min || v.default_moments_min)}
           </div>
           <div class="toggle-row">
             <label class="check"><input id="bs_mirror" type="checkbox" ${cur.mirror ? "checked" : ""}> Mirror the video</label>
             <label class="check"><input id="bs_effects" type="checkbox" ${cur.effects === false ? "" : "checked"}> Add sound effects and B-roll</label>
           </div>
           ${logoBlock("bs", batchLogo, logoRes.logo, "#bs_orient")}
+          ${bumperChecks("bs", { intro: cur.intro === undefined ? v.default_intro_on : cur.intro, outro: cur.outro === undefined ? v.default_outro_on : cur.outro }, brandRes.branding)}
           <div class="row"><button type="submit">${icon("sparkle")} Save and generate for ready videos</button></div>
           <p class="small muted">Videos still transcribing start as soon as they are ready.</p>
-        </form>
+        </form></details>
       </div>
       <section class="card" style="margin-top:18px">
         <div class="card-head"><h2>Videos</h2></div>
@@ -920,7 +981,9 @@
           captions_style: document.getElementById("bs_caps").value,
           mirror: document.getElementById("bs_mirror").checked,
           effects: document.getElementById("bs_effects").checked,
-          moments_per_clip: readMix("bs"),
+          ...readMix("bs"),
+          intro: document.getElementById("bs_intro").checked,
+          outro: document.getElementById("bs_outro").checked,
           logo: readLogo("bs"),
         }});
         toast(`Started for ${r.applied} videos${r.waiting ? `, ${r.waiting} will start when ready` : ""}${r.errors.length ? `. ${r.errors.length} could not start: ${r.errors[0]}` : ""}`);
@@ -1132,10 +1195,11 @@
     const token = routeId;  // a newer page has replaced this one if this changes
     setNav("setup");
     stopPolling();
-    const [settings, providers, models, preflight, presets, library, logoRes] = await Promise.all([
+    const [settings, providers, models, preflight, presets, library, logoRes, brandRes] = await Promise.all([
       api("/settings"), api("/providers"), api("/models"), api("/preflight"), api("/providers/presets"), api("/effects"),
-      api("/logo"),
+      api("/logo"), api("/branding"),
     ]);
+    const branding = brandRes.branding;
     if (token !== routeId) return;
     const v = settings.values;
     const logo = logoRes.logo;
@@ -1198,8 +1262,27 @@
         </div>
       </div>
 
-      <form id="logoForm" class="card stack" style="margin-top:18px">
-        <div class="card-head"><div class="row"><div class="bubble">${icon("sparkle")}</div><div><h2>Brand logo</h2><div class="desc">Upload your logo once. It can go on every clip. You can turn it off, or move it, for each project.</div></div></div></div>
+      <details class="card fold" open style="margin-top:18px">
+        <summary class="card-head fold-head"><div class="row"><div class="bubble">${icon("film")}</div><div><h2>Intro and outro</h2><div class="desc">Optional videos that play before and after each clip. Each one is up to 60 seconds, with sound.</div></div></div></summary>
+        <div class="stack">
+          ${["intro", "outro"].map((kind) => {
+            const info = branding[kind];
+            return `<div class="row" style="justify-content:space-between;align-items:center">
+              <div><strong>${kind === "intro" ? "Intro" : "Outro"}</strong>
+                <div class="small muted">${info ? `${esc(info.name)} · ${Number(info.duration).toFixed(0)} seconds` : "Not uploaded yet"}</div></div>
+              <div class="row">
+                <input type="file" id="bf_${kind}" accept=".mp4,.mov,.webm,.mkv,video/*" aria-label="${kind} video">
+                <button type="button" class="secondary sm" id="bu_${kind}">${icon("upload")} Upload</button>
+                <button type="button" class="danger secondary sm" id="br_${kind}" ${info ? "" : "disabled"}>${icon("trash")} Remove</button>
+              </div></div>`;
+          }).join("")}
+          <p class="small muted">Turn these on for each project or batch, or set the default for new ones in Default clip settings below.</p>
+        </div>
+      </details>
+
+      <details class="card fold" open style="margin-top:18px">
+        <summary class="card-head fold-head"><div class="row"><div class="bubble">${icon("sparkle")}</div><div><h2>Brand logo</h2><div class="desc">Upload your logo once. It can go on every clip. You can turn it off, or move it, for each project.</div></div></div></summary>
+        <form id="logoForm" class="stack">
         <div class="row" style="align-items:flex-end">
           <div class="dropzone" id="dropLogo" style="padding:16px;flex:1 1 260px">${icon("upload")}<div class="title" style="font-size:.92rem">${logo ? "Replace the logo" : "Choose a logo"}</div>
             <div class="field-hint">A PNG with a transparent background works best. JPG and WebP work too.</div>
@@ -1215,14 +1298,16 @@
         ${logoBlock("dl", logoDefaults, logo, "#dl_orient")}
         <div class="row"><button type="submit">Save logo settings</button><span class="small muted">These are the defaults for new projects.</span></div>
       </form>
+      </details>
 
-      <form id="defaultsForm" class="card stack" style="margin-top:18px">
-        <div class="card-head"><div class="row"><div class="bubble">${icon("sliders")}</div><div><h2>Default clip settings</h2><div class="desc">Used for new projects. You can change them for each project.</div></div></div></div>
+      <details class="card fold" open style="margin-top:18px">
+        <summary class="card-head fold-head"><div class="row"><div class="bubble">${icon("sliders")}</div><div><h2>Default clip settings</h2><div class="desc">Used for new projects. You can change them for each project.</div></div></div></summary>
+      <form id="defaultsForm" class="stack">
         <div class="field-grid">
           <div><label for="d_theme">Theme</label><select id="d_theme">${library.themes.map((t) => `<option ${t.name === v.default_theme ? "selected" : ""}>${esc(t.name)}</option>`).join("")}</select></div>
           <div><label for="d_len">Clip length (seconds)</label><input id="d_len" type="number" min="1" value="${esc(v.default_clip_length)}"></div>
           <div><label for="d_count">Clips per video</label><input id="d_count" type="number" min="1" max="20" value="${esc(v.default_clip_count)}"></div>
-          ${mixBlock("d", v.default_moments_per_clip)}
+          ${mixBlock("d", v.default_moments_per_clip, v.default_moments_min)}
           <div><label for="d_orient">Orientation</label><select id="d_orient">${["landscape", "vertical", "square"].map((o) => `<option ${o === v.default_orientation ? "selected" : ""}>${o}</option>`).join("")}</select></div>
           <div><label for="d_res">Resolution</label><select id="d_res">${["1080p", "720p"].map((o) => `<option ${o === v.default_resolution ? "selected" : ""}>${o}</option>`).join("")}</select></div>
           <div><label for="d_caps">Captions</label><select id="d_caps">${["classic", "bold", "boxed", "karaoke", "off"].map((o) => `<option ${o === v.default_captions_style ? "selected" : ""}>${o}</option>`).join("")}</select></div>
@@ -1230,9 +1315,12 @@
             <option value="local" ${v.transcription_mode === "local" ? "selected" : ""}>Local Whisper (on this server)</option>
             <option value="cloud" ${v.transcription_mode === "cloud" ? "selected" : ""}>Cloud provider, then local</option></select></div>
         </div>
-        <div class="toggle-row"><label class="check"><input id="d_mirror" type="checkbox" ${v.default_mirror ? "checked" : ""}> Mirror by default</label></div>
+        <div class="toggle-row"><label class="check"><input id="d_mirror" type="checkbox" ${v.default_mirror ? "checked" : ""}> Mirror by default</label>
+          <label class="check"><input id="d_intro_on" type="checkbox" ${v.default_intro_on ? "checked" : ""}> Add intro to new projects</label>
+          <label class="check"><input id="d_outro_on" type="checkbox" ${v.default_outro_on ? "checked" : ""}> Add outro to new projects</label></div>
         <div><button type="submit">Save defaults</button></div>
       </form>
+      </details>
 
       <section class="card" style="margin-top:18px">
         <div class="card-head"><div class="row"><div class="bubble">${icon("stack")}</div><div><h2>Transcription models</h2><div class="desc">Whisper runs on this server. Model: <strong>${esc(settings.whisper_model)}</strong>.</div></div></div></div>
@@ -1304,6 +1392,28 @@
       } catch (err) { toast(err.message); }
     });
 
+    ["intro", "outro"].forEach((kind) => {
+      document.getElementById(`bu_${kind}`).addEventListener("click", async () => {
+        const f = document.getElementById(`bf_${kind}`).files[0];
+        if (!f) { toast("Choose a video first"); return; }
+        const form = new FormData();
+        form.append("file", f);
+        try {
+          await api(`/branding/${kind}`, { method: "POST", body: form });
+          toast(`${kind === "intro" ? "Intro" : "Outro"} saved`);
+          viewSetup();
+        } catch (err) { toast(err.message); }
+      });
+      document.getElementById(`br_${kind}`).addEventListener("click", async () => {
+        if (!confirm(`Remove the ${kind} video?`)) return;
+        try {
+          await api(`/branding/${kind}`, { method: "DELETE" });
+          toast("Removed");
+          viewSetup();
+        } catch (err) { toast(err.message); }
+      });
+    });
+
     document.getElementById("defaultsForm").addEventListener("submit", async (ev) => {
       ev.preventDefault();
       try {
@@ -1315,7 +1425,10 @@
           default_resolution: document.getElementById("d_res").value,
           default_captions_style: document.getElementById("d_caps").value,
           default_mirror: document.getElementById("d_mirror").checked,
-          default_moments_per_clip: readMix("d"),
+          default_moments_per_clip: readMix("d").moments_per_clip,
+          default_moments_min: readMix("d").moments_min,
+          default_intro_on: document.getElementById("d_intro_on").checked,
+          default_outro_on: document.getElementById("d_outro_on").checked,
           transcription_mode: document.getElementById("d_tmode").value,
         }}});
         toast("Defaults saved");

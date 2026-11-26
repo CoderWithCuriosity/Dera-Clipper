@@ -244,6 +244,9 @@ class Database:
             ("projects", "moments_per_clip", "INTEGER NOT NULL DEFAULT 1"),  # 1 = single moments
             ("projects", "logo_json", "TEXT"),                              # logo options used for this project
             ("clips", "segments_json", "TEXT"),                             # joined moments [[start, end], ...]
+            ("projects", "moments_min", "INTEGER NOT NULL DEFAULT 1"),      # fewest moments in a mixed clip
+            ("projects", "extras_json", "TEXT"),                            # {"intro": bool, "outro": bool}
+            ("clips", "texts_json", "TEXT"),                                # title and description history
         ]
         with self._conn() as conn:
             for table, column, decl in additions:

@@ -58,3 +58,16 @@ def check_logo_file(name: str, head: bytes) -> str:
     if not (is_png or is_jpg or is_webp):
         raise ValueError("This file is not a real PNG, JPG or WebP image")
     return ext
+
+
+# Intro and outro: one video of each per user, joined before and after the clip.
+BUMPER_KINDS = ("intro", "outro")
+BUMPER_EXTENSIONS = (".mp4", ".mov", ".webm", ".mkv")
+BUMPER_MAX_BYTES = 200 * 1024 * 1024
+BUMPER_MAX_SECONDS = 60
+
+
+def bumper_key(user_id: str, kind: str) -> str:
+    if kind not in BUMPER_KINDS:
+        raise ValueError("Unknown kind")
+    return f"branding/{user_id}/{kind}.mp4"

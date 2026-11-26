@@ -8,7 +8,18 @@ AI Clipper turns long videos into short clips with captions. The user picks a cl
 
 ## Status
 
-All four roadmap phases are built and committed. Tests: 77 pass, 1 skipped (PostgreSQL, needs a scratch database URL).
+All four roadmap phases are built and committed. Tests: 116 pass, 1 skipped (PostgreSQL, needs a scratch database URL).
+
+Work since phase 4 (latest first):
+
+| Commit | Contents |
+|---|---|
+| this commit | Mixed clips with a random number of moments per clip (fewest to most); a title and description per clip with a version history (regenerate keeps earlier versions, "Use this" picks one); optional intro and outro videos per user, chosen per project or batch, with defaults in Setup; collapsible sections; guards against zero and impossible moment settings |
+| `d4b8338` | Page and scripts served with `no-cache`; script and style links carry a version taken from the file contents |
+| `ce3417c` | Logo keyed by upload time, so an old logo cannot be shown; the image is served `no-store` |
+| `e755d94` | Brand logo with placement, mixed highlight clips, separate job worker (`clipper worker`, `deploy/clipper-worker.service`), heavy and light job slots, chunked local transcription, quieter polling, view guards against stale results |
+
+Earlier phases:
 
 | Commit | Phase | Contents |
 |---|---|---|
@@ -19,7 +30,16 @@ All four roadmap phases are built and committed. Tests: 77 pass, 1 skipped (Post
 | `1d194be` | verification | Provider keys tested before saving, transcript-sharing notice, Docker fonts |
 | `ed3165b` | docs | Effect generator step before tests |
 
-Uncommitted at the time of writing: this file, `.env` (git-ignored), and nothing else.
+| Commit | Phase | Contents |
+|---|---|---|
+| `75c1c94` | 1: core, local | Upload or link input, local Whisper, planning with fallback, FFmpeg rendering, job queue, web UI, preflight |
+| `d41808a` | 2: providers and effects | Full provider list (Anthropic, cloud Whisper), priority fallback, usage counters, effect library with manifests and transcript cache, ducking, B-roll |
+| `1d2abd8` | 3: multi-user and deployment | Accounts and sessions, admin panel, per-user limits, S3 storage, AWS Transcribe (code only, not in use), PostgreSQL path, backups, retention, deploy files |
+| `b2d6c60` | 4: polish | Karaoke and other caption styles, regenerate with options, metrics and analytics, batches |
+| `1d194be` | verification | Provider keys tested before saving, transcript-sharing notice, Docker fonts |
+| `ed3165b` | docs | Effect generator step before tests |
+
+Uncommitted: nothing, after the commit that carries this file. `.env` is git-ignored.
 
 ## Decisions
 
@@ -94,8 +114,19 @@ Uncommitted at the time of writing: this file, `.env` (git-ignored), and nothing
 - Docker image: written, not built.
 - Interface: tested in jsdom (every page loads with no runtime errors, sign-in works). Not checked visually in a real browser.
 
+## Server operations (added with the worker split)
+
+- Two services: `clipper` (website, `CLIPPER_RUN_WORKER=false`) and `clipper-worker` (`python -m clipper worker`, Nice 10, CPUQuota 170%, MemoryMax 2800M). Worker concurrency comes from `CLIPPER_WORKER_CONCURRENCY=4`, with `CLIPPER_HEAVY_JOBS=1` (transcribing and rendering, one at a time) and `CLIPPER_LIGHT_JOBS=3` (planning and downloads). Set these in `/etc/clipper/clipper.env`.
+- Code is copied into `/opt/clipper` (it is not a git checkout). Before each deploy, copy the current `clipper` and `web` folders into `/home/ubuntu/pre-*` as a backup. The live code matched the last commit before the logo work.
+- The database is `/var/lib/clipper/clipper.db`, readable only by `clipper`. Migrations run on start. They only add columns.
+- Long videos were the cause of crashes: a 1 h 52 min video used about 3.5 GB, and the kernel's OOM killer ended the process repeatedly. Transcription now runs in 10-minute pieces. Do not put heavy work back in the web process.
+- Logo and page caching: the browser kept old copies of the logo and of `app.js`. The logo URL includes its upload time, and the page sends `no-cache` with versioned script links. If a browser still shows old UI, a reload should fix it.
+
 ## Lessons from testing
 
+- Race on navigation: a view that finished loading after the user had left it wrote into the new page and showed "can't access property innerHTML". Each view now checks a route token after every await, and results from an old page are dropped.
+- Moment ranges: a random count per clip is validated on the server and on the client. Zero and fewer than 2 moments in a mixed clip are refused, and each moment must be at least 4 seconds.
+- A 1x1 crop of a yuv420p frame is zero-sized. Tests read a 2x2 block.
 - A fresh install had no effects until the library was scanned. The app now scans at startup.
 - The first account was not becoming admin because a local profile row was counted. Fixed.
 - Access tokens issued in the same second were identical. Each token now has a unique ID.

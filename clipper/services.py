@@ -184,23 +184,38 @@ def start_generation(svc: "Services", project: dict, opts: dict) -> None:
         raise ValueError("Unknown resolution")
     try:
         per_clip = int(opts.get("moments_per_clip") or 1)
+        fewest = int(opts.get("moments_min") or per_clip)
     except (TypeError, ValueError) as exc:
-        raise ValueError("Moments per clip must be a whole number") from exc
-    if not 1 <= per_clip <= MOMENTS_MAX:
+        raise ValueError("Moments per clip must be whole numbers") from exc
+    if not 1 <= per_clip <= MOMENTS_MAX or not 1 <= fewest <= MOMENTS_MAX:
         raise ValueError(f"Moments per clip must be between 1 and {MOMENTS_MAX}")
-    if per_clip > 1 and clip_length / per_clip < MOMENTS_MIN_SECONDS:
+    if fewest > per_clip:
+        raise ValueError("The fewest moments cannot be more than the most moments")
+    if per_clip > 1 and fewest < 2:
+        raise ValueError("A mixed clip needs at least 2 moments. Use Single moments for one moment per clip")
+    if per_clip == 1:
+        fewest = 1
+    if clip_count < 1:
+        raise ValueError("Clip count must be at least 1")
+    if clip_length / per_clip < MOMENTS_MIN_SECONDS:
         raise ValueError(
-            f"With {per_clip} moments per clip, the clip length must be at least "
-            f"{MOMENTS_MIN_SECONDS * per_clip:.0f} seconds, so each moment is long enough to follow"
+            f"With up to {per_clip} moments per clip, each moment would be shorter than "
+            f"{MOMENTS_MIN_SECONDS:.0f} seconds. Use a longer clip length or fewer moments"
         )
     logo = clean_logo(opts.get("logo"))
     if logo["enabled"] and not svc.storage.exists(logo_key(project["user_id"])):
         raise ValueError("Upload your logo in Setup before adding it to clips")
+    from .branding import bumper_key
+
+    for kind in ("intro", "outro"):
+        if opts.get(kind) and not svc.storage.exists(bumper_key(project["user_id"], kind)):
+            raise ValueError(f"Upload your {kind} video in Setup before adding it to clips")
     svc.set_project(
         project["id"], theme=theme, clip_length=clip_length, clip_count=clip_count,
         mirror=1 if opts.get("mirror") else 0, captions_style=captions, orientation=orientation,
         effects_enabled=1 if opts.get("effects", True) else 0,
-        resolution=resolution, moments_per_clip=per_clip, logo_json=dumps(logo),
+        resolution=resolution, moments_per_clip=per_clip, moments_min=fewest, logo_json=dumps(logo),
+        extras_json=dumps({"intro": bool(opts.get("intro")), "outro": bool(opts.get("outro"))}),
         error=None, status="planning", status_message="Queued for planning", progress=0.0,
     )
     svc.queue.enqueue(project["user_id"], project["id"], "plan")

@@ -4,6 +4,7 @@ non-overlapping, and close to the requested length."""
 from __future__ import annotations
 
 import logging
+import random
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -176,21 +177,44 @@ def heuristic_moments(segments: list[dict], clip_length: float, duration: float,
     return picks
 
 
-def group_highlights(moments: list[Moment], per_clip: int, clip_count: int) -> list[list[Moment]]:
-    """Turn ranked moments into mixed clips of per_clip moments each.
+def draw_sizes(fewest: int, most: int, count: int, rng=None) -> list[int]:
+    """How many moments each clip gets: a random number from fewest to most, one per clip.
+    Equal values give the same number for every clip."""
+    if count < 1:
+        raise ValueError("At least one clip is needed")
+    if fewest < 1 or most < fewest:
+        raise ValueError("Moments per clip must be at least 1, and the most must not be below the fewest")
+    rng = rng or random
+    return [rng.randint(fewest, most) for _ in range(count)]
+
+
+def group_highlights(moments: list[Moment], sizes: list[int]) -> list[list[Moment]]:
+    """Deal ranked moments into clips, one clip per entry of sizes, each taking its own number.
 
     The best moments are dealt out in turns, so every clip gets a mix of strong and weaker
-    moments instead of one clip holding all the best ones. Inside each clip the moments are
-    put back in video order, so the joined clip plays in the order things happened. Fewer
-    than clip_count clips are made when there are not enough moments for all of them."""
-    if not moments:
+    moments. Inside each clip the moments are put back in video order. A clip that would get no
+    moments is left out, and a clip never gets more moments than it was given."""
+    if not moments or not sizes:
         return []
+    if any(size < 1 for size in sizes):
+        raise ValueError("Every clip needs at least one moment")
+    # Keep as many clips as the moments can fill in full. If there are too few moments for even the
+    # first clip, that one clip takes what there is.
+    kept: list[int] = []
+    needed = 0
+    for size in sizes:
+        if needed + size > len(moments):
+            break
+        kept.append(size)
+        needed += size
+    if not kept:
+        kept = [len(moments)]
     ranked = sorted(moments, key=lambda m: m.score, reverse=True)
-    groups = max(1, min(clip_count, len(ranked) // max(1, per_clip)))
-    pool = ranked[: groups * per_clip] if len(ranked) >= groups * per_clip else ranked
-    buckets: list[list[Moment]] = [[] for _ in range(groups)]
-    for i, moment in enumerate(pool):
-        buckets[i % groups].append(moment)
+    buckets: list[list[Moment]] = [[] for _ in kept]
+    while ranked and any(len(b) < size for b, size in zip(buckets, kept)):
+        for bucket, size in zip(buckets, kept):
+            if ranked and len(bucket) < size:
+                bucket.append(ranked.pop(0))
     return [sorted(b, key=lambda m: m.start) for b in buckets if b]
 
 
