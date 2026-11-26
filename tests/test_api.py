@@ -113,12 +113,12 @@ def test_delete_project_removes_it(client, sample_video):
 def test_provider_crud_hides_keys_and_requires_key_where_needed(client):
     assert client.post("/api/providers", json={"preset": "groq", "priority": 1}).status_code == 400
 
-    res = client.post("/api/providers", json={"preset": "groq", "api_key": "gsk_abcdef1234", "priority": 1})
+    res = client.post("/api/providers", json={"preset": "groq", "api_key": "gsk_abcdef1234", "priority": 1, "verify": False})
     assert res.status_code == 201
     created = res.json()
     assert "gsk_" not in res.text and created["key_hint"].endswith("1234")
 
-    res = client.post("/api/providers", json={"preset": "ollama", "priority": 2})
+    res = client.post("/api/providers", json={"preset": "ollama", "priority": 2, "verify": False})
     assert res.status_code == 201
 
     listing = client.get("/api/providers").json()["providers"]
@@ -144,3 +144,10 @@ def test_preflight_reports_ffmpeg(client):
     checks = client.get("/api/preflight").json()["checks"]
     ffmpeg = [c for c in checks if c["name"] == "FFmpeg"][0]
     assert ffmpeg["ok"] is True
+
+
+def test_provider_that_fails_its_test_is_not_saved(client):
+    res = client.post("/api/providers", json={"preset": "custom", "base_url": "http://127.0.0.1:9/v1",
+                                              "model": "m", "priority": 5})
+    assert res.status_code == 400 and "not saved" in res.json()["detail"]
+    assert all(p["priority"] != 5 for p in client.get("/api/providers").json()["providers"])

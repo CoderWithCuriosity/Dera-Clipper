@@ -276,7 +276,7 @@ def test_transcription_provider_needs_key(client):
     res = client.post("/api/providers", json={"kind": "transcription", "preset": "openai_whisper"})
     assert res.status_code == 400
     res = client.post("/api/providers", json={"kind": "transcription", "preset": "openai_whisper",
-                                              "api_key": "sk-abcd1234"})
+                                              "api_key": "sk-abcd1234", "verify": False})
     assert res.status_code == 201 and res.json()["kind"] == "transcription"
 
 

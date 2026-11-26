@@ -116,7 +116,7 @@ Edit `/etc/clipper/clipper.env` and set `CLIPPER_MASTER_KEY`. Then install `depl
 
 ## What has been tested
 
-- Unit and end-to-end tests with real FFmpeg renders: 76 tests, run with `python -m pytest` (one PostgreSQL test is skipped until a scratch database is provided).
+- Unit and end-to-end tests with real FFmpeg renders: 77 tests, run with `python -m pytest` (one PostgreSQL test is skipped until a scratch database is provided).
 - Real speech transcribed with local Whisper (`tiny`), then a vertical clip rendered, checked end to end.
 - S3 storage and the full pipeline on S3, using a mocked S3 (moto).
 - Not verified against live services in this environment: PostgreSQL (the code path exists and runs when `CLIPPER_TEST_PG_URL` points at a scratch database), real AWS Transcribe (the result parser is tested on a sample document), real cloud LLM and Whisper APIs (adapters are tested with mocked HTTP), and the Docker image build.

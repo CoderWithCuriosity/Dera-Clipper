@@ -79,6 +79,7 @@ class ProviderIn(BaseModel):
     api_key: Optional[str] = None
     priority: int = 100
     enabled: bool = True
+    verify: bool = True  # send a small test request before the provider is saved
 
 
 class ProviderPatch(BaseModel):
@@ -445,6 +446,18 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
         model = (body.model or preset.get("model") or "").strip()
         if not model:
             raise HTTPException(400, "Enter a model name")
+        if body.verify:
+            probe = {
+                "id": "probe", "preset": body.preset, "kind": body.kind, "base_url": base_url or None,
+                "model": model, "api_key_enc": encrypt_secret(settings, body.api_key) if body.api_key else None,
+            }
+            try:
+                if body.kind == "transcription":
+                    check_transcription_provider(settings, probe)
+                else:
+                    build_llm_provider(settings, probe).test()
+            except Exception as exc:
+                raise HTTPException(400, f"The provider did not accept a test request, so it was not saved: {exc}")
         provider_id = new_id()
         s.db.run(
             "INSERT INTO providers (id, user_id, kind, preset, name, base_url, model, api_key_enc, api_key_hint, "

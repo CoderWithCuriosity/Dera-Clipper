@@ -6,6 +6,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
     CLIPPER_MODE=aws CLIPPER_HOST=0.0.0.0 CLIPPER_PORT=8000 CLIPPER_DATA_DIR=/data
 
 WORKDIR /app
+# Captions are burned in with libass, which needs fonts. Without them, captions can disappear.
+RUN apt-get update && apt-get install -y --no-install-recommends fontconfig fonts-liberation \n    && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt boto3 "psycopg[binary]"
 COPY . .

@@ -384,7 +384,8 @@
 
       <section class="panel stack">
         <h2>Providers</h2>
-        <p class="muted small">Language models and transcription services are each tried in priority order (lowest number first). If one fails, hits its limit, or returns a bad answer, the next one is used. Keys are encrypted and only the last four characters are shown.</p>
+        <p class="muted small">Language models and transcription services are each tried in priority order (lowest number first). If one fails, hits its limit, or returns a bad answer, the next one is used. Keys are encrypted and only the last four characters are shown. Each new key is tested before it is saved.</p>
+        <p class="notice small" style="margin:0">Privacy: the transcript text of your videos is sent to the language model and transcription providers you configure. Video and audio files are not sent to language models. Use Ollama or local Whisper to keep everything on your machine.</p>
         <div style="overflow-x:auto"><table><thead><tr><th>Priority</th><th>Provider</th><th>State</th><th>Test</th><th>Usage</th><th></th></tr></thead>
           <tbody>${providerRows || "<tr><td colspan='6' class='muted'>No providers yet. Add one below.</td></tr>"}</tbody></table></div>
         <form id="providerForm" class="stack" style="border-top:1px solid var(--line);padding-top:12px">
