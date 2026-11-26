@@ -64,7 +64,8 @@ class Services:
                 log.warning("Skipping provider %s: %s", row["name"], exc)
         return built
 
-    def record_usage(self, provider_id: str, tokens: int = 0, failed: bool = False) -> None:
+    def record_usage(self, provider_id: str, tokens: int = 0, failed: bool = False,
+                     rate_limit: Optional[dict] = None) -> None:
         from .db import today
 
         self.db.run(
@@ -73,6 +74,28 @@ class Services:
             "tokens = provider_usage.tokens + excluded.tokens, failures = provider_usage.failures + excluded.failures",
             (provider_id, today(), int(tokens), 1 if failed else 0),
         )
+        if rate_limit:
+            # Keep the limits the provider last reported, so the settings page can show them.
+            self.db.run("UPDATE providers SET last_rate_limit = ? WHERE id = ?", (dumps(rate_limit), provider_id))
+
+    def transcription_chain(self, user_id: str, mode: str) -> list:
+        """Engines to try in order. Mode "local" uses only local Whisper. Mode "cloud" uses the
+        enabled cloud providers by priority, and falls back to local Whisper if none work."""
+        engines: list = []
+        if mode == "cloud":
+            rows = self.db.all(
+                "SELECT * FROM providers WHERE user_id = ? AND kind = 'transcription' AND enabled = 1 "
+                "ORDER BY priority, created_at", (user_id,),
+            )
+            for row in rows:
+                try:
+                    engines.append((row["id"], build_transcription_provider(self, row)))
+                except Exception as exc:
+                    log.warning("Skipping transcription provider %s: %s", row["name"], exc)
+        from .transcription import build_local_engine
+
+        engines.append(("local", build_local_engine(self.settings)))
+        return engines
 
 
 def build_llm_provider(settings: Settings, row: dict) -> LLMProvider:
@@ -82,7 +105,24 @@ def build_llm_provider(settings: Settings, row: dict) -> LLMProvider:
     api_key = decrypt_secret(settings, row["api_key_enc"]) if row.get("api_key_enc") else None
     base_url = row.get("base_url") or preset["base_url"]
     model = row.get("model") or preset["model"]
+    if preset["kind"] == "anthropic":
+        from .llm.anthropic import AnthropicProvider
+
+        return AnthropicProvider(name=row["id"], base_url=base_url, model=model, api_key=api_key)
     return OpenAICompatible(name=row["id"], base_url=base_url, model=model, api_key=api_key)
+
+
+def build_transcription_provider(svc: "Services", row: dict):
+    from .transcription.cloud import TRANSCRIPTION_PRESETS, WhisperAPI
+
+    preset = TRANSCRIPTION_PRESETS.get(row["preset"])
+    if preset is None:
+        raise ValueError(f"unknown transcription preset {row['preset']}")
+    api_key = decrypt_secret(svc.settings, row["api_key_enc"]) if row.get("api_key_enc") else None
+    return WhisperAPI(
+        name=row["id"], base_url=row.get("base_url") or preset["base_url"],
+        model=row.get("model") or preset["model"], api_key=api_key, ffmpeg=svc.require_ffmpeg(),
+    )
 
 
 class JobQueue:

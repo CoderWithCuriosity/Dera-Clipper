@@ -115,9 +115,10 @@ def load_settings() -> Settings:
 
     # Mode defaults. Each one can be overridden by its own variable.
     defaults = {
+        # engine = default transcription mode: "local" (Whisper on this machine) or "cloud"
         "local": dict(storage="local", auth=False, engine="local", concurrency=1, whisper="small"),
         "vps": dict(storage="local", auth=True, engine="local", concurrency=1, whisper="base"),
-        "aws": dict(storage="s3", auth=True, engine="groq", concurrency=2, whisper="base"),
+        "aws": dict(storage="s3", auth=True, engine="cloud", concurrency=2, whisper="base"),
     }[mode]
 
     storage = (_get("STORAGE", defaults["storage"]) or "local").lower()

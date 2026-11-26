@@ -223,6 +223,7 @@
             </div>
             <div class="small muted">${fmtDuration(c.start)} to ${fmtDuration(c.end)} · ${Math.round(c.length)} s</div>
             <div>${esc(c.reason || "")}</div>
+            ${(c.effects || []).length ? `<div class="small muted">Effects: ${c.effects.map((e) => esc(e.effect_id) + " at " + Math.round(e.at) + " s").join(", ")}</div>` : ""}
             ${c.error ? `<div class="error small">${esc(c.error)}</div>` : ""}
             <div class="row">
               ${c.download_url ? `<a class="button" href="${esc(c.download_url)}">Download</a>` : ""}
@@ -292,24 +293,32 @@
   async function viewSetup() {
     setNav("setup");
     stopPolling();
-    const [settings, providers, models, preflight, presets] = await Promise.all([
-      api("/settings"), api("/providers"), api("/models"), api("/preflight"), api("/providers/presets"),
+    const [settings, providers, models, preflight, presets, library] = await Promise.all([
+      api("/settings"), api("/providers"), api("/models"), api("/preflight"), api("/providers/presets"), api("/effects"),
     ]);
     const v = settings.values;
-    const presetOptions = Object.entries(presets.presets).filter(([k]) => k !== "anthropic")
-      .map(([k, p]) => `<option value="${esc(k)}">${esc(p.label)}</option>`).join("");
+    const llmPresets = presets.presets;
+    const transPresets = presets.transcription_presets;
 
     const checks = preflight.checks.map((c) => `
       <li><span class="badge ${c.ok ? "done" : c.level === "warning" ? "warn" : "failed"}">${c.ok ? "OK" : c.level === "warning" ? "Warning" : "Missing"}</span>
         <strong>${esc(c.name)}</strong>: ${esc(c.message)}</li>`).join("");
 
-    const providerRows = providers.providers.filter((p) => p.kind === "llm").map((p) => `
+    const rateText = (rate) => {
+      if (!rate) return "";
+      const keys = Object.keys(rate);
+      return keys.length ? `<div class="small muted">Last reported: ${keys.map((k) => `${esc(k)}=${esc(rate[k])}`).join(", ")}</div>` : "";
+    };
+
+    const providerRows = providers.providers.map((p) => `
       <tr>
         <td>${esc(p.priority)}</td>
-        <td><strong>${esc(p.name)}</strong><div class="small muted">${esc(p.preset_label)} · ${esc(p.model)}</div></td>
+        <td><strong>${esc(p.name)}</strong><div class="small muted">${p.kind === "transcription" ? "Transcription" : "Language model"} · ${esc(p.preset_label)} · ${esc(p.model)}</div>
+          ${p.key_hint ? `<div class="small muted">Key ${esc(p.key_hint)}</div>` : ""}</td>
         <td>${p.enabled ? "On" : "Off"}</td>
         <td>${p.last_test_ok === null ? "Not tested" : p.last_test_ok ? "<span class='badge done'>Connected</span>" : `<span class='badge failed'>${esc(p.last_test_error || "Failed")}</span>`}</td>
-        <td class="small">Today: ${p.usage_today.requests} requests, ${p.usage_today.tokens} tokens${p.usage_today.failures ? `, ${p.usage_today.failures} failures` : ""}
+        <td class="small">Today: ${p.usage_today.requests} requests, ${p.usage_today.tokens} tokens${p.usage_today.failures ? `, <span class="error">${p.usage_today.failures} failures</span>` : ""}
+          ${rateText(p.last_rate_limit)}
           ${p.docs_url ? `<div><a href="${esc(p.docs_url)}" target="_blank" rel="noopener">Free-tier limits (provider docs)</a></div>` : ""}</td>
         <td><div class="row">
           <button class="secondary" data-test="${esc(p.id)}">Test</button>
@@ -323,6 +332,13 @@
         <td>${m.slow_on_cpu ? "<span class='small muted'>Slow on CPU</span>" : ""}</td>
         <td>${m.downloaded ? "" : `<button class="secondary" data-model="${esc(m.name)}">Download</button>`}</td></tr>`).join("");
 
+    const themeRows = library.themes.map((t) => `
+      <li><strong>${esc(t.name)}</strong> · ${t.count} effect${t.count === 1 ? "" : "s"}
+        ${t.effects.map((e) => `<div class="small muted">${esc(e.kind === "sound" ? "Sound" : "B-roll")}: ${esc(e.file)}${e.duration ? ` (${e.duration.toFixed(1)} s)` : ""}${e.license ? ` · ${esc(e.license)}` : ""}</div>`).join("")}
+      </li>`).join("");
+
+    const presetOptions = (map) => Object.entries(map).map(([k, p]) => `<option value="${esc(k)}">${esc(p.label)}</option>`).join("");
+
     app.innerHTML = `
       <h1>Setup</h1>
       <section class="panel"><h2>Health check</h2><ul class="check-list">${checks}</ul></section>
@@ -330,7 +346,8 @@
       <form id="defaultsForm" class="panel stack">
         <h2>Default clip settings</h2>
         <div class="grid">
-          <div><label for="d_theme">Theme</label><input id="d_theme" value="${esc(v.default_theme)}"></div>
+          <div><label for="d_theme">Theme</label>
+            <select id="d_theme">${library.themes.map((t) => `<option ${t.name === v.default_theme ? "selected" : ""}>${esc(t.name)}</option>`).join("")}</select></div>
           <div><label for="d_len">Clip length (s)</label><input id="d_len" type="number" min="1" value="${esc(v.default_clip_length)}"></div>
           <div><label for="d_count">Clip count</label><input id="d_count" type="number" min="1" max="20" value="${esc(v.default_clip_count)}"></div>
           <div><label for="d_orient">Orientation</label>
@@ -339,6 +356,11 @@
             <select id="d_res">${["1080p", "720p"].map((o) => `<option ${o === v.default_resolution ? "selected" : ""}>${o}</option>`).join("")}</select></div>
           <div><label for="d_caps">Captions</label>
             <select id="d_caps">${["classic", "bold", "boxed", "off"].map((o) => `<option ${o === v.default_captions_style ? "selected" : ""}>${o}</option>`).join("")}</select></div>
+          <div><label for="d_tmode">Transcription</label>
+            <select id="d_tmode">
+              <option value="local" ${v.transcription_mode === "local" ? "selected" : ""}>Local Whisper (on this machine)</option>
+              <option value="cloud" ${v.transcription_mode === "cloud" ? "selected" : ""}>Cloud provider (falls back to local)</option>
+            </select></div>
         </div>
         <label class="check"><input id="d_mirror" type="checkbox" ${v.default_mirror ? "checked" : ""}> Mirror by default</label>
         <div><button type="submit">Save defaults</button></div>
@@ -346,19 +368,21 @@
 
       <section class="panel">
         <h2>Transcription</h2>
-        <p class="muted small">Engine: <strong>${esc(settings.transcription_engine)}</strong> · Whisper model: <strong>${esc(settings.whisper_model)}</strong> · Mode: ${esc(settings.mode)}</p>
+        <p class="muted small">Whisper model: <strong>${esc(settings.whisper_model)}</strong> · Mode: ${esc(settings.mode)}</p>
         <div style="overflow-x:auto"><table><thead><tr><th>Model</th><th>Status</th><th></th><th></th></tr></thead><tbody>${modelRows}</tbody></table></div>
       </section>
 
       <section class="panel stack">
-        <h2>Language model providers</h2>
-        <p class="muted small">Providers are tried in priority order (lowest number first). If one fails or hits its limit, the next is used. Keys are encrypted and never shown again in full.</p>
+        <h2>Providers</h2>
+        <p class="muted small">Language models and transcription services are each tried in priority order (lowest number first). If one fails, hits its limit, or returns a bad answer, the next one is used. Keys are encrypted and only the last four characters are shown.</p>
         <div style="overflow-x:auto"><table><thead><tr><th>Priority</th><th>Provider</th><th>State</th><th>Test</th><th>Usage</th><th></th></tr></thead>
           <tbody>${providerRows || "<tr><td colspan='6' class='muted'>No providers yet. Add one below.</td></tr>"}</tbody></table></div>
         <form id="providerForm" class="stack" style="border-top:1px solid var(--line);padding-top:12px">
           <h2>Add a provider</h2>
           <div class="grid">
-            <div><label for="p_preset">Provider</label><select id="p_preset">${presetOptions}</select></div>
+            <div><label for="p_kind">Type</label>
+              <select id="p_kind"><option value="llm">Language model (picks clips)</option><option value="transcription">Transcription (speech to text)</option></select></div>
+            <div><label for="p_preset">Service</label><select id="p_preset"></select></div>
             <div><label for="p_name">Name</label><input id="p_name" placeholder="Shown in the list"></div>
             <div><label for="p_base">Base URL</label><input id="p_base" placeholder="Leave blank to use the default"></div>
             <div><label for="p_model">Model</label><input id="p_model" placeholder="Leave blank to use the default"></div>
@@ -367,7 +391,26 @@
           </div>
           <div><button type="submit">Save provider</button></div>
         </form>
+      </section>
+
+      <section class="panel stack">
+        <div class="row" style="justify-content:space-between">
+          <h2 style="margin:0">Effect library</h2>
+          <button class="secondary" id="rescanBtn">Rescan library</button>
+        </div>
+        <p class="muted small">Add files to a theme folder, list them in its manifest.json, then rescan. Each file's license is read from the manifest.</p>
+        <ul class="check-list">${themeRows || "<li class='muted'>No themes found. Check the effects folder.</li>"}</ul>
+        <div id="scanResult" class="small"></div>
       </section>`;
+
+    const kindSelect = document.getElementById("p_kind");
+    const presetSelect = document.getElementById("p_preset");
+    const fillPresets = () => {
+      const map = kindSelect.value === "transcription" ? transPresets : llmPresets;
+      presetSelect.innerHTML = presetOptions(map);
+    };
+    kindSelect.addEventListener("change", fillPresets);
+    fillPresets();
 
     document.getElementById("defaultsForm").addEventListener("submit", async (ev) => {
       ev.preventDefault();
@@ -380,6 +423,7 @@
           default_resolution: document.getElementById("d_res").value,
           default_captions_style: document.getElementById("d_caps").value,
           default_mirror: document.getElementById("d_mirror").checked,
+          transcription_mode: document.getElementById("d_tmode").value,
         }}});
         toast("Defaults saved");
       } catch (err) { toast(err.message); }
@@ -389,8 +433,8 @@
       ev.preventDefault();
       try {
         await api("/providers", { method: "POST", json: {
-          kind: "llm",
-          preset: document.getElementById("p_preset").value,
+          kind: kindSelect.value,
+          preset: presetSelect.value,
           name: document.getElementById("p_name").value || null,
           base_url: document.getElementById("p_base").value || null,
           model: document.getElementById("p_model").value || null,
@@ -399,6 +443,16 @@
         }});
         toast("Provider saved");
         viewSetup();
+      } catch (err) { toast(err.message); }
+    });
+
+    document.getElementById("rescanBtn").addEventListener("click", async () => {
+      try {
+        const r = await api("/effects/rescan", { method: "POST" });
+        document.getElementById("scanResult").innerHTML =
+          `Scanned ${r.themes} themes, ${r.effects} effects, ${r.transcribed} transcribed.` +
+          (r.warnings.length ? `<ul>${r.warnings.map((w) => `<li class="error">${esc(w)}</li>`).join("")}</ul>` : " No problems found.");
+        toast("Library rescanned");
       } catch (err) { toast(err.message); }
     });
 

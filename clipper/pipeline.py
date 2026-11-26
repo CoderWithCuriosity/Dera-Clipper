@@ -13,7 +13,7 @@ import httpx
 
 from .db import dumps, loads, new_id, now_iso
 from .media import MediaError, frame_size
-from .planner import plan_moments
+from .planner import HEURISTIC, plan_moments
 from .security import SecurityError, check_upload_header, validate_link
 from .services import Services
 from .transcription import Transcript, TranscriptionError
@@ -50,13 +50,9 @@ def _load_transcript(svc: Services, project_id: str) -> Optional[Transcript]:
     )
 
 
-def build_transcription_engine(svc: Services, user_id: str, engine_name: Optional[str]):
-    from .transcription import build_local_engine
-
-    name = engine_name or svc.settings.default_transcription_engine
-    if name.startswith("whisper_local") or name == "local":
-        return build_local_engine(svc.settings)
-    raise TranscriptionError(f"Transcription engine '{name}' is not available")
+def build_transcription_chain(svc: Services, user_id: str, mode: str) -> list:
+    """Ordered (name, engine) pairs. Each one is tried until one succeeds."""
+    return svc.transcription_chain(user_id, mode)
 
 
 def download_link(url: str, dst: Path, max_bytes: int) -> None:
@@ -147,8 +143,7 @@ def handle_transcribe(svc: Services, job: dict) -> None:
         return
 
     ff = svc.require_ffmpeg()
-    engine = build_transcription_engine(svc, p["user_id"], p.get("transcription_engine"))
-    engine.check()
+    chain = build_transcription_chain(svc, p["user_id"], p.get("transcription_mode") or "local")
     work = _work_dir(svc, pid)
     local = svc.storage.local_path(p["source_key"])
 
@@ -160,12 +155,23 @@ def handle_transcribe(svc: Services, job: dict) -> None:
     def progress(fraction: float) -> None:
         svc.set_project(pid, progress=round(fraction, 3))
 
-    try:
-        transcript = engine.transcribe(audio, progress=progress)
-    except TranscriptionError as exc:
-        if exc.retryable:
-            raise TransientError(str(exc)) from exc
-        raise
+    transcript: Optional[Transcript] = None
+    errors: list[str] = []
+    for name, engine in chain:
+        try:
+            engine.check()
+            transcript = engine.transcribe(audio, progress=progress)
+            if name != "local":
+                svc.record_usage(name)
+            break
+        except TranscriptionError as exc:
+            errors.append(f"{name}: {exc}")
+            log.warning("Transcription with %s failed: %s", name, exc)
+            if name != "local":
+                svc.record_usage(name, failed=True)
+    if transcript is None:
+        audio.unlink(missing_ok=True)
+        raise TranscriptionError("No transcription engine could run. " + "; ".join(errors))
 
     svc.db.run("DELETE FROM transcripts WHERE project_id = ?", (pid,))
     svc.db.run(
@@ -192,7 +198,7 @@ def handle_plan(svc: Services, job: dict) -> None:
     providers = svc.llm_providers(p["user_id"])
 
     def usage(name: str, result) -> None:
-        svc.record_usage(name, tokens=result.tokens)
+        svc.record_usage(name, tokens=result.tokens, rate_limit=result.rate_limit)
 
     def failure(name: str, _message: str) -> None:
         svc.record_usage(name, failed=True)
@@ -203,6 +209,13 @@ def handle_plan(svc: Services, job: dict) -> None:
     )
     if not moments:
         raise MediaError("No clip moments could be found in this video")
+
+    from .effects import finalize_placements
+
+    finalize_placements(
+        svc, p["theme"], moments, transcript,
+        language_model_answered=used != HEURISTIC, seed=pid,
+    )
 
     svc.db.run("DELETE FROM clips WHERE project_id = ?", (pid,))
     settings_snapshot = dumps({

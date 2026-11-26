@@ -83,7 +83,7 @@ class FakeEngine:
 def app_env(tmp_path, monkeypatch):
     monkeypatch.setenv("CLIPPER_MODE", "local")
     monkeypatch.setenv("CLIPPER_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("CLIPPER_EFFECTS_DIR", str(tmp_path / "effects"))
+    monkeypatch.setenv("CLIPPER_EFFECTS_DIR", str(ROOT / "effects"))
     monkeypatch.setenv("CLIPPER_RUN_WORKER", "true")
     monkeypatch.setenv("CLIPPER_JOB_MAX_ATTEMPTS", "1")
     monkeypatch.setenv("CLIPPER_MASTER_KEY", "test-master-key-for-tests")
@@ -100,8 +100,8 @@ def client(app_env, monkeypatch):
     from clipper.api import create_app
     from clipper.config import load_settings
 
-    monkeypatch.setattr(pipeline, "build_transcription_engine",
-                        lambda svc, user_id, name: FakeEngine(duration=40.0))
+    monkeypatch.setattr(pipeline, "build_transcription_chain",
+                        lambda svc, user_id, mode: [("local", FakeEngine(duration=40.0))])
     app = create_app(load_settings())
     with TestClient(app) as c:
         yield c

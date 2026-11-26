@@ -73,7 +73,8 @@ def run_checks(svc: Services) -> list[dict]:
         add("Storage", True, f"Local disk at {s.data_dir / 'objects'}")
 
     # Transcription
-    if s.default_transcription_engine.startswith(("whisper_local", "local")):
+    local_engine = s.default_transcription_engine == "local"
+    if local_engine:
         try:
             import faster_whisper  # noqa: F401
 
@@ -93,7 +94,6 @@ def run_checks(svc: Services) -> list[dict]:
     # Memory, by mode
     mem = total_memory_gb()
     if mem is not None:
-        local_engine = s.default_transcription_engine.startswith(("whisper_local", "local"))
         if s.mode == "local":
             need = 8.0
         elif s.mode == "vps":

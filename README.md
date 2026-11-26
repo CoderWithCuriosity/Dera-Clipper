@@ -47,6 +47,30 @@ Every variable is `CLIPPER_<NAME>`. The main ones:
 
 The model only ever receives text. It never receives video or audio.
 
+## Providers
+
+Language models (picking clips): Groq, Google Gemini, OpenAI, DeepSeek, OpenRouter, Anthropic Claude, Ollama (local, free), or any OpenAI-compatible endpoint.
+
+Transcription: local Whisper (default), Groq Whisper, or OpenAI Whisper. In cloud mode, cloud providers are tried by priority and local Whisper is the final fallback.
+
+Free-tier limits change often, so the app does not hard-code them. Each provider card links to its docs and shows the limits it reported on the last response. Usage counters show requests, tokens, and failures for the day.
+
+## Effect library
+
+```
+effects/
+  funny/
+    manifest.json      display name, description, and one entry per file
+    sfx/               sound effects
+    broll/             short reaction clips
+```
+
+Each manifest entry has `file`, `kind` (`sound` or `broll`), optional `tags`, `speech` (true if the file contains speech, which is transcribed once and cached by content hash), `license`, and `source`. Add files, update the manifest, and click **Rescan library** in Setup.
+
+To create placeholder effects for testing: `python scripts/make_placeholder_effects.py`. They are generated tones and colour clips with no third-party license.
+
+Placements from the language model are checked: they must name a real effect, sit on a sentence end or pause, stay at least two seconds apart, and fit the clip. Sound is ducked automatically while someone speaks. If no model answers, effects are placed randomly at sentence ends, up to the per-clip limit (`CLIPPER_MAX_EFFECTS_PER_CLIP`, default 4).
+
 ## Tests
 
 ```bash

@@ -93,7 +93,8 @@ CREATE TABLE IF NOT EXISTS projects (
     captions_style TEXT NOT NULL DEFAULT 'classic',
     orientation TEXT NOT NULL DEFAULT 'landscape',
     resolution TEXT NOT NULL DEFAULT '1080p',
-    transcription_engine TEXT,
+    transcription_mode TEXT NOT NULL DEFAULT 'local',  -- local | cloud
+    transcription_engine TEXT,                       -- the engine that actually ran
     error TEXT,
     provider_used TEXT,
     created_at TEXT NOT NULL,

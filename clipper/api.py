@@ -18,11 +18,15 @@ from pydantic import BaseModel, Field
 from . import effects
 from .config import ROOT, Settings, load_settings
 from .db import dumps, loads, new_id, now_iso, today
+import httpx
+
 from .llm import PRESETS
-from .media import ORIENTATIONS, RESOLUTIONS, MediaError
+from .media import ORIENTATIONS, RESOLUTIONS
 from .pipeline import handlers as pipeline_handlers
+from .transcription.cloud import TRANSCRIPTION_PRESETS
 from .security import (
-    SecurityError, check_extension, check_upload_header, encrypt_secret, safe_filename, validate_link,
+    SecurityError, check_extension, check_upload_header, decrypt_secret, encrypt_secret, safe_filename,
+    validate_link,
 )
 from .services import Services, build_llm_provider
 from .storage import LocalStorage
@@ -94,6 +98,13 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        try:
+            summary = effects.rescan(svc)  # keep the library in step with the effects folder
+            log.info("Effect library: %d effects in %d themes", summary["effects"], summary["themes"])
+            for warning in summary["warnings"]:
+                log.warning("Effect library: %s", warning)
+        except Exception as exc:  # the app still starts without effects
+            log.warning("Effect library could not be scanned: %s", exc)
         run = settings.run_worker if start_worker is None else start_worker
         if run:
             svc.queue.start(pipeline_handlers(svc), settings.worker_concurrency)
@@ -134,15 +145,14 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
     @app.get("/api/settings")
     def get_settings(user: dict = user_dep, s: Services = svc_dep) -> dict:
         rows = s.db.all("SELECT key, value FROM settings WHERE user_id = ?", (user["id"],))
-        values = dict(USER_SETTING_DEFAULTS)
+        values = dict(USER_SETTING_DEFAULTS, transcription_mode=settings.default_transcription_engine)
         values.update({r["key"]: loads(r["value"]) for r in rows})
         return {"values": values, "mode": settings.mode, "storage": settings.storage,
-                "transcription_engine": settings.default_transcription_engine,
                 "whisper_model": settings.whisper_model}
 
     @app.put("/api/settings")
     def put_settings(body: SettingsPatch, user: dict = user_dep, s: Services = svc_dep) -> dict:
-        allowed = set(USER_SETTING_DEFAULTS)
+        allowed = set(USER_SETTING_DEFAULTS) | {"transcription_mode"}
         for key, value in body.values.items():
             if key not in allowed:
                 raise HTTPException(400, f"Unknown setting {key}")
@@ -181,7 +191,22 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
     # -- providers ---------------------------------------------------------------
     @app.get("/api/providers/presets")
     def presets() -> dict:
-        return {"presets": {k: {kk: vv for kk, vv in v.items()} for k, v in PRESETS.items()}}
+        return {"presets": PRESETS, "transcription_presets": TRANSCRIPTION_PRESETS}
+
+    # -- effects -------------------------------------------------------------------
+    @app.get("/api/effects")
+    def list_effects(s: Services = svc_dep) -> dict:
+        themes = []
+        for name in effects.list_themes(s):
+            rows = s.db.all("SELECT id, kind, file_name, duration, tags_json, license FROM effects WHERE theme = ? ORDER BY id", (name,))
+            themes.append({"name": name, "count": len(rows), "effects": [
+                {"id": r["id"], "kind": r["kind"], "file": r["file_name"], "duration": r["duration"],
+                 "tags": loads(r["tags_json"], []), "license": r["license"]} for r in rows]})
+        return {"themes": themes, "max_effects_per_clip": settings.max_effects_per_clip}
+
+    @app.post("/api/effects/rescan")
+    def rescan_effects(s: Services = svc_dep) -> dict:
+        return effects.rescan(s)
 
     @app.get("/api/providers")
     def list_providers(user: dict = user_dep, s: Services = svc_dep) -> dict:
@@ -200,17 +225,20 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
 
     @app.post("/api/providers", status_code=201)
     def create_provider(body: ProviderIn, user: dict = user_dep, s: Services = svc_dep) -> dict:
-        if body.kind != "llm":
-            raise HTTPException(400, "Only language model providers can be added here")
-        preset = PRESETS.get(body.preset)
+        if body.kind == "llm":
+            preset = PRESETS.get(body.preset)
+        elif body.kind == "transcription":
+            preset = TRANSCRIPTION_PRESETS.get(body.preset)
+        else:
+            raise HTTPException(400, "kind must be 'llm' or 'transcription'")
         if preset is None:
             raise HTTPException(400, "Unknown provider preset")
         if preset.get("key_required") and not body.api_key:
             raise HTTPException(400, "This provider needs an API key")
-        base_url = (body.base_url or preset["base_url"] or "").strip()
+        base_url = (body.base_url or preset.get("base_url") or "").strip()
         if body.preset == "custom" and not base_url:
             raise HTTPException(400, "Enter the base URL for the custom endpoint")
-        model = (body.model or preset["model"] or "").strip()
+        model = (body.model or preset.get("model") or "").strip()
         if not model:
             raise HTTPException(400, "Enter a model name")
         provider_id = new_id()
@@ -257,7 +285,10 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
     def test_provider(provider_id: str, user: dict = user_dep, s: Services = svc_dep) -> dict:
         row = _owned(s, "providers", provider_id, user)
         try:
-            message = build_llm_provider(settings, row).test()
+            if row["kind"] == "transcription":
+                message = check_transcription_provider(settings, row)
+            else:
+                message = build_llm_provider(settings, row).test()
             ok, error = True, None
         except Exception as exc:
             ok, error, message = False, str(exc), None
@@ -325,12 +356,14 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
             source_type, location, source_key, file_size = "link", url.strip(), None, None
 
         display = (title or "").strip() or (Path(location).stem if source_type == "upload" else location[:80])
+        mode_row = s.db.one("SELECT value FROM settings WHERE user_id = ? AND key = 'transcription_mode'", (user["id"],))
+        transcription_mode = loads(mode_row["value"]) if mode_row else settings.default_transcription_engine
         s.db.run(
             "INSERT INTO projects (id, user_id, title, source_type, source_location, source_key, file_size, mode, "
-            "status, progress, status_message, transcription_engine, created_at, updated_at) "
+            "status, progress, status_message, transcription_mode, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, 'Waiting to start', ?, ?, ?)",
             (project_id, user["id"], display, source_type, location, source_key, file_size, settings.mode,
-             None, now, now),
+             transcription_mode, now, now),
         )
         s.queue.enqueue(user["id"], project_id, "download")
         return _project_view(s, s.db.one("SELECT * FROM projects WHERE id = ?", (project_id,)))
@@ -488,6 +521,8 @@ def _ensure_local_user(svc: Services) -> None:
 
 
 def _validate_setting(key: str, value, svc: Services) -> None:
+    if key == "transcription_mode" and value not in ("local", "cloud"):
+        raise HTTPException(400, "Transcription mode must be 'local' or 'cloud'")
     if key == "default_theme" and value not in effects.list_themes(svc):
         raise HTTPException(400, "Unknown theme")
     if key == "default_clip_length" and (not isinstance(value, (int, float)) or value <= 0):
@@ -539,8 +574,25 @@ def _serve_clip(svc: Services, clip: dict, attachment: bool):
     return FileResponse(path, media_type="video/mp4", headers={"Content-Disposition": f'inline; filename="{filename}"'})
 
 
+def check_transcription_provider(settings: Settings, row: dict) -> str:
+    """Check the key with a cheap authenticated request that does not use any audio."""
+    preset = TRANSCRIPTION_PRESETS.get(row["preset"], {})
+    base = (row.get("base_url") or preset.get("base_url") or "").rstrip("/")
+    api_key = decrypt_secret(settings, row["api_key_enc"]) if row.get("api_key_enc") else ""
+    try:
+        resp = httpx.get(f"{base}/models", headers={"Authorization": f"Bearer {api_key}"}, timeout=20)
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"Network error: {exc.__class__.__name__}") from exc
+    if resp.status_code in (401, 403):
+        raise RuntimeError("The API key was rejected")
+    if resp.status_code >= 400:
+        raise RuntimeError(f"HTTP {resp.status_code}")
+    return "Connection OK"
+
+
 def _provider_view(row: dict, usage: Optional[dict]) -> dict:
-    preset = PRESETS.get(row["preset"], {})
+    preset = PRESETS.get(row["preset"]) or TRANSCRIPTION_PRESETS.get(row["preset"]) or {}
+    rate = loads(row.get("last_rate_limit"), None)
     return {
         "id": row["id"],
         "kind": row["kind"],
@@ -556,6 +608,7 @@ def _provider_view(row: dict, usage: Optional[dict]) -> dict:
         "last_test_error": row.get("last_test_error"),
         "last_tested_at": row.get("last_tested_at"),
         "limits_note": row.get("limits_note"),
+        "last_rate_limit": rate,
         "docs_url": preset.get("docs") or None,
         "usage_today": usage,
     }

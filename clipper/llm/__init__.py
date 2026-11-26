@@ -66,6 +66,11 @@ PRESETS: dict[str, dict[str, Any]] = {
         "model": "meta-llama/llama-3.3-70b-instruct:free", "key_required": True,
         "docs": "https://openrouter.ai/docs/limits",
     },
+    "anthropic": {
+        "label": "Anthropic Claude", "kind": "anthropic", "base_url": "https://api.anthropic.com/v1",
+        "model": "claude-sonnet-5-5", "key_required": True,
+        "docs": "https://docs.anthropic.com/en/api/rate-limits",
+    },
     "ollama": {
         "label": "Ollama (local)", "kind": "openai", "base_url": "http://localhost:11434/v1",
         "model": "qwen2.5:7b", "key_required": False,

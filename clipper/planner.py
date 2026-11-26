@@ -75,7 +75,10 @@ def build_user_prompt(theme: str, clip_length: float, count: int, section: list[
     if effects_catalog:
         lines.append("Available effects (id, kind, tags):")
         for e in effects_catalog:
-            lines.append(f"- {e['id']} ({e['kind']}; {', '.join(e.get('tags', [])) or 'no tags'})")
+            line = f"- {e['id']} ({e['kind']}; {', '.join(e.get('tags', [])) or 'no tags'})"
+            if e.get("says"):
+                line += f' says: "{e["says"]}"'
+            lines.append(line)
     lines.append("Transcript section (times in seconds):")
     lines.append(_format_section(section))
     return "\n".join(lines)
