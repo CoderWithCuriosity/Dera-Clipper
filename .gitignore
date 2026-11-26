@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+data/
+.env
+*.db
+*.db-wal
+*.db-shm
+.pytest_cache/
+effects/**/sfx/**
+effects/**/broll/**
+!effects/**/sfx/.gitkeep
+!effects/**/broll/.gitkeep

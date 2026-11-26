@@ -1,0 +1,6 @@
+# Optional, install only for the modes that need them:
+# faster-whisper>=1.0      local transcription (Local and VPS modes)
+# boto3>=1.34              S3 storage and AWS Transcribe (VPS/AWS modes)
+# psycopg[binary]>=3.1     PostgreSQL (multi-user)
+# yt-dlp                    link downloads from video platforms (check platform terms first)
+# pytest                    tests
