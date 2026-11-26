@@ -3,6 +3,7 @@ multi-user mode only has to change how the user is identified."""
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import threading
 import zipfile
@@ -10,12 +11,16 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import effects
+from .auth import (
+    AuthError, RateLimiter, check_password_rules, hash_password, issue_access_token, issue_refresh_token,
+    read_access_token, revoke_all, rotate_refresh_token, verify_password,
+)
 from .config import ROOT, Settings, load_settings
 from .db import dumps, loads, new_id, now_iso, today
 import httpx
@@ -89,12 +94,28 @@ class SettingsPatch(BaseModel):
     values: dict
 
 
+class AuthBody(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=1, max_length=256)
+
+
+class PasswordBody(BaseModel):
+    current_password: str
+    new_password: str
+
+
+class AdminUserPatch(BaseModel):
+    role: Optional[str] = None
+    disabled: Optional[bool] = None
+
+
 # -- app factory -----------------------------------------------------------------
 
 def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool] = None) -> FastAPI:
     settings = settings or load_settings()
     svc = Services.create(settings)
-    _ensure_local_user(svc)
+    if not settings.require_auth:
+        _ensure_local_user(svc)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -106,10 +127,18 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
         except Exception as exc:  # the app still starts without effects
             log.warning("Effect library could not be scanned: %s", exc)
         run = settings.run_worker if start_worker is None else start_worker
+        maintenance = None
         if run:
             svc.queue.start(pipeline_handlers(svc), settings.worker_concurrency)
             log.info("Worker started with concurrency %d", settings.worker_concurrency)
+            if settings.maintenance:
+                from .maintenance import Maintenance
+
+                maintenance = Maintenance(svc)
+                maintenance.start()
         yield
+        if maintenance:
+            maintenance.stop()
         svc.queue.stop()
 
     app = FastAPI(title="AI Clipper", version="1.0.0", lifespan=lifespan)
@@ -118,12 +147,178 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
     def get_svc() -> Services:
         return svc
 
+    limiter = RateLimiter()
+
     def current_user(request: Request) -> dict:
-        # Solo mode: one local profile. Multi-user mode replaces this function.
-        return {"id": "local", "role": "admin", "email": "local@localhost"}
+        if not settings.require_auth:
+            # Solo mode: one local profile, no sign-in (the app listens on localhost by default).
+            user = {"id": "local", "role": "admin", "email": "local@localhost"}
+        else:
+            header = request.headers.get("authorization", "")
+            if not header.lower().startswith("bearer "):
+                raise HTTPException(401, "Sign in to continue")
+            payload = read_access_token(settings, header[7:].strip())
+            if payload is None:
+                raise HTTPException(401, "Your session has expired. Sign in again.")
+            row = svc.db.one("SELECT * FROM users WHERE id = ?", (payload["sub"],))
+            if row is None or row["disabled"]:
+                raise HTTPException(401, "This account is not available")
+            user = {"id": row["id"], "role": row["role"], "email": row["email"]}
+        if not limiter.allow(f"api:{user['id']}", settings.api_requests_per_minute, 60):
+            raise HTTPException(429, "Too many requests. Wait a minute and try again.")
+        return user
+
+    def require_admin(user: dict = Depends(current_user)) -> dict:
+        if user["role"] != "admin":
+            raise HTTPException(403, "Only administrators can do that")
+        return user
 
     user_dep = Depends(current_user)
+    admin_dep = Depends(require_admin)
     svc_dep = Depends(get_svc)
+
+    # -- accounts ------------------------------------------------------------------
+    @app.post("/api/auth/register", status_code=201)
+    def register(body: AuthBody, request: Request, response: Response, s: Services = svc_dep) -> dict:
+        if not settings.require_auth:
+            raise HTTPException(400, "Sign-in is turned off in this mode")
+        if not settings.allow_registration:
+            raise HTTPException(403, "Registration is closed. Ask an administrator for an account.")
+        email = _clean_email(body.email)
+        try:
+            check_password_rules(body.password)
+        except AuthError as exc:
+            raise HTTPException(exc.status, str(exc))
+        if s.db.one("SELECT id FROM users WHERE email = ?", (email,)):
+            raise HTTPException(409, "An account with this email already exists")
+        first = s.db.one("SELECT COUNT(*) AS n FROM users WHERE id <> 'local'")["n"] == 0
+        role = "admin" if first or (settings.admin_email and email == settings.admin_email) else "user"
+        user_id = new_id()
+        s.db.run(
+            "INSERT INTO users (id, email, password_hash, role, disabled, created_at) VALUES (?, ?, ?, ?, 0, ?)",
+            (user_id, email, hash_password(body.password), role, now_iso()),
+        )
+        return _start_session(s, user_id, email, role, response)
+
+    @app.post("/api/auth/login")
+    def login(body: AuthBody, request: Request, response: Response, s: Services = svc_dep) -> dict:
+        if not settings.require_auth:
+            raise HTTPException(400, "Sign-in is turned off in this mode")
+        email = _clean_email(body.email)
+        ip = request.client.host if request.client else "unknown"
+        if not limiter.allow(f"login:{ip}:{email}", settings.login_attempts_per_15_min, 15 * 60):
+            raise HTTPException(429, "Too many sign-in attempts. Try again in 15 minutes.")
+        row = s.db.one("SELECT * FROM users WHERE email = ?", (email,))
+        if row is None or not verify_password(body.password, row["password_hash"]):
+            raise HTTPException(401, "Email or password is wrong")
+        if row["disabled"]:
+            raise HTTPException(403, "This account has been disabled")
+        return _start_session(s, row["id"], email, row["role"], response)
+
+    @app.post("/api/auth/refresh")
+    def refresh(request: Request, response: Response, s: Services = svc_dep) -> dict:
+        token = request.cookies.get("clipper_refresh")
+        user_id = rotate_refresh_token(s.db, token) if token else None
+        if user_id is None:
+            response.delete_cookie("clipper_refresh", path="/api/auth")
+            raise HTTPException(401, "Sign in to continue")
+        row = s.db.one("SELECT * FROM users WHERE id = ?", (user_id,))
+        if row is None or row["disabled"]:
+            raise HTTPException(401, "Sign in to continue")
+        return _start_session(s, row["id"], row["email"], row["role"], response)
+
+    @app.post("/api/auth/logout")
+    def logout(request: Request, response: Response, s: Services = svc_dep) -> dict:
+        token = request.cookies.get("clipper_refresh")
+        if token:
+            user_id = rotate_refresh_token(s.db, token)
+            if user_id:
+                revoke_all(s.db, user_id)
+        response.delete_cookie("clipper_refresh", path="/api/auth")
+        return {"signed_out": True}
+
+    @app.get("/api/auth/me")
+    def me(user: dict = user_dep) -> dict:
+        return {"user": user, "auth_required": settings.require_auth}
+
+    @app.post("/api/auth/change-password")
+    def change_password(body: PasswordBody, user: dict = user_dep, s: Services = svc_dep) -> dict:
+        row = s.db.one("SELECT * FROM users WHERE id = ?", (user["id"],))
+        if row is None or not verify_password(body.current_password, row["password_hash"]):
+            raise HTTPException(400, "The current password is wrong")
+        try:
+            check_password_rules(body.new_password)
+        except AuthError as exc:
+            raise HTTPException(exc.status, str(exc))
+        s.db.run("UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(body.new_password), user["id"]))
+        revoke_all(s.db, user["id"])
+        return {"changed": True, "message": "Password changed. Sign in again on other devices."}
+
+    # -- administration ------------------------------------------------------------
+    @app.get("/api/admin/users")
+    def admin_users(_admin: dict = admin_dep, s: Services = svc_dep) -> dict:
+        rows = s.db.all("SELECT id, email, role, disabled, created_at FROM users ORDER BY created_at")
+        out = []
+        for r in rows:
+            projects = s.db.one("SELECT COUNT(*) AS n FROM projects WHERE user_id = ?", (r["id"],))["n"]
+            out.append({**r, "disabled": bool(r["disabled"]), "projects": projects})
+        return {"users": out}
+
+    @app.patch("/api/admin/users/{user_id}")
+    def admin_update_user(user_id: str, body: AdminUserPatch, admin: dict = admin_dep, s: Services = svc_dep) -> dict:
+        row = s.db.one("SELECT * FROM users WHERE id = ?", (user_id,))
+        if row is None:
+            raise HTTPException(404, "Not found")
+        changes: dict = {}
+        if body.role is not None:
+            if body.role not in ("admin", "user"):
+                raise HTTPException(400, "Role must be 'admin' or 'user'")
+            if row["role"] == "admin" and body.role != "admin" and _admin_count(s) <= 1:
+                raise HTTPException(400, "There must be at least one administrator")
+            changes["role"] = body.role
+        if body.disabled is not None:
+            if body.disabled and user_id == admin["id"]:
+                raise HTTPException(400, "You cannot disable your own account")
+            changes["disabled"] = 1 if body.disabled else 0
+            if body.disabled:
+                revoke_all(s.db, user_id)
+        if changes:
+            cols = ", ".join(f"{k} = ?" for k in changes)
+            s.db.run(f"UPDATE users SET {cols} WHERE id = ?", (*changes.values(), user_id))
+        return {"updated": True}
+
+    @app.get("/api/admin/stats")
+    def admin_stats(_admin: dict = admin_dep, s: Services = svc_dep) -> dict:
+        def count(sql: str, params: tuple = ()) -> int:
+            return s.db.one(sql, params)["n"]
+
+        return {
+            "users": count("SELECT COUNT(*) AS n FROM users"),
+            "projects": count("SELECT COUNT(*) AS n FROM projects"),
+            "projects_by_status": {r["status"]: r["n"] for r in s.db.all(
+                "SELECT status, COUNT(*) AS n FROM projects GROUP BY status")},
+            "jobs_by_status": {r["status"]: r["n"] for r in s.db.all(
+                "SELECT status, COUNT(*) AS n FROM jobs GROUP BY status")},
+            "clips_done": count("SELECT COUNT(*) AS n FROM clips WHERE status = 'done'"),
+            "providers": count("SELECT COUNT(*) AS n FROM providers"),
+            "stored_upload_mb": round((s.db.one("SELECT COALESCE(SUM(file_size), 0) AS n FROM projects")["n"] or 0) / 1048576, 1),
+        }
+
+    @app.get("/api/admin/backups")
+    def admin_backups(_admin: dict = admin_dep) -> dict:
+        from .backup import list_backups
+
+        return {"backups": list_backups(settings)}
+
+    @app.post("/api/admin/backups", status_code=201)
+    def admin_backup_now(_admin: dict = admin_dep) -> dict:
+        from .backup import create_backup
+
+        try:
+            path = create_backup(settings)
+        except Exception as exc:
+            raise HTTPException(500, str(exc))
+        return {"name": path.name}
 
     # -- health and preflight ----------------------------------------------------
     @app.get("/api/health")
@@ -131,7 +326,7 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
         return {"ok": True, "mode": settings.mode}
 
     @app.get("/api/preflight")
-    def preflight() -> dict:
+    def preflight(_admin: dict = admin_dep) -> dict:
         from .preflight import run_checks
 
         return {"mode": settings.mode, "checks": run_checks(svc)}
@@ -173,7 +368,7 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
                 "active": settings.whisper_model}
 
     @app.post("/api/models/{name}/download", status_code=202)
-    def download_model(name: str, s: Services = svc_dep) -> dict:
+    def download_model(name: str, _admin: dict = admin_dep, s: Services = svc_dep) -> dict:
         from .transcription.local import MODEL_SIZES, LocalWhisper
 
         if name not in MODEL_SIZES:
@@ -205,7 +400,7 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
         return {"themes": themes, "max_effects_per_clip": settings.max_effects_per_clip}
 
     @app.post("/api/effects/rescan")
-    def rescan_effects(s: Services = svc_dep) -> dict:
+    def rescan_effects(_admin: dict = admin_dep, s: Services = svc_dep) -> dict:
         return effects.rescan(s)
 
     @app.get("/api/providers")
@@ -313,6 +508,10 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
         )["n"]
         if today_count >= settings.max_projects_per_user_per_day:
             raise HTTPException(429, "Daily project limit reached")
+        used_mb = (s.db.one("SELECT COALESCE(SUM(file_size), 0) AS n FROM projects WHERE user_id = ?",
+                            (user["id"],))["n"] or 0) / 1048576
+        if used_mb >= settings.user_storage_quota_mb:
+            raise HTTPException(413, "Your storage quota is full. Delete old projects to free space.")
         if bool(file) == bool(url and url.strip()):
             raise HTTPException(400, "Send either a file or a link, not both and not neither")
 
@@ -511,6 +710,32 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
 
 # -- helpers ---------------------------------------------------------------------
 
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _clean_email(value: str) -> str:
+    email = (value or "").strip().lower()
+    if not _EMAIL_RE.match(email):
+        raise HTTPException(400, "Enter a valid email address")
+    return email
+
+
+def _start_session(s: Services, user_id: str, email: str, role: str, response: Response) -> dict:
+    """Issue a short-lived access token in the body, and a rotating refresh token in an
+    HttpOnly cookie that only the /api/auth routes can read."""
+    refresh = issue_refresh_token(s.db, user_id)
+    response.set_cookie(
+        "clipper_refresh", refresh, httponly=True, samesite="lax", secure=s.settings.cookie_secure,
+        path="/api/auth", max_age=30 * 24 * 3600,
+    )
+    access = issue_access_token(s.settings, {"id": user_id, "role": role})
+    return {"access_token": access, "expires_in": 900, "user": {"id": user_id, "email": email, "role": role}}
+
+
+def _admin_count(s: Services) -> int:
+    return s.db.one("SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND disabled = 0")["n"]
+
+
 def _ensure_local_user(svc: Services) -> None:
     if svc.db.one("SELECT id FROM users WHERE id = 'local'") is None:
         svc.db.run(
@@ -576,6 +801,14 @@ def _serve_clip(svc: Services, clip: dict, attachment: bool):
 
 def check_transcription_provider(settings: Settings, row: dict) -> str:
     """Check the key with a cheap authenticated request that does not use any audio."""
+    if row["preset"] == "aws_transcribe":
+        try:
+            import boto3
+
+            boto3.client("transcribe", region_name=settings.s3_region).list_transcription_jobs(MaxResults=1)
+        except Exception as exc:
+            raise RuntimeError(f"AWS Transcribe is not reachable: {exc}") from exc
+        return "Connection OK (AWS credentials accepted)"
     preset = TRANSCRIPTION_PRESETS.get(row["preset"], {})
     base = (row.get("base_url") or preset.get("base_url") or "").rstrip("/")
     api_key = decrypt_secret(settings, row["api_key_enc"]) if row.get("api_key_enc") else ""

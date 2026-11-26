@@ -76,6 +76,15 @@ class Settings:
     max_projects_per_user_per_day: int
     api_requests_per_minute: int
     job_max_attempts: int
+    max_running_jobs_per_user: int
+    user_storage_quota_mb: int
+    allow_registration: bool
+    admin_email: Optional[str]
+    cookie_secure: bool
+    login_attempts_per_15_min: int
+    backup_every_hours: int
+    backup_keep: int
+    maintenance: bool
 
     @property
     def sqlite_path(self) -> Optional[Path]:
@@ -152,4 +161,13 @@ def load_settings() -> Settings:
         max_projects_per_user_per_day=_int("MAX_PROJECTS_PER_USER_PER_DAY", 50),
         api_requests_per_minute=_int("API_REQUESTS_PER_MINUTE", 300),
         job_max_attempts=_int("JOB_MAX_ATTEMPTS", 3),
+        max_running_jobs_per_user=_int("MAX_RUNNING_JOBS_PER_USER", 2),
+        user_storage_quota_mb=_int("USER_STORAGE_QUOTA_MB", 10240),
+        allow_registration=_bool("ALLOW_REGISTRATION", True),
+        admin_email=(_get("ADMIN_EMAIL") or "").strip().lower() or None,
+        cookie_secure=_bool("COOKIE_SECURE", mode != "local"),
+        login_attempts_per_15_min=_int("LOGIN_ATTEMPTS_PER_15_MIN", 10),
+        backup_every_hours=_int("BACKUP_EVERY_HOURS", 24 if mode != "local" else 0),
+        backup_keep=_int("BACKUP_KEEP", 14),
+        maintenance=_bool("MAINTENANCE", True),
     )

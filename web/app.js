@@ -22,22 +22,6 @@
     toastTimer = setTimeout(() => { el.hidden = true; }, 3500);
   }
 
-  async function api(path, options) {
-    const opts = Object.assign({ method: "GET", headers: {} }, options || {});
-    if (opts.json !== undefined) {
-      opts.headers["Content-Type"] = "application/json";
-      opts.body = JSON.stringify(opts.json);
-    }
-    const res = await fetch("/api" + path, opts);
-    let data = null;
-    try { data = await res.json(); } catch (_) { data = null; }
-    if (!res.ok) {
-      const detail = data && data.detail ? (typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail)) : res.statusText;
-      throw new Error(detail || "Request failed");
-    }
-    return data;
-  }
-
   function fmtDuration(seconds) {
     if (seconds == null) return "-";
     const s = Math.round(seconds);
@@ -479,13 +463,207 @@
     }));
   }
 
+  // -- session -------------------------------------------------------------------
+  const session = { token: null, user: null, authRequired: false };
+
+  async function refreshSession() {
+    const res = await fetch("/api/auth/refresh", { method: "POST", credentials: "same-origin" });
+    if (!res.ok) return false;
+    const data = await res.json();
+    session.token = data.access_token;
+    session.user = data.user;
+    return true;
+  }
+
+  async function api(path, options, retried) {
+    const opts = Object.assign({ method: "GET", headers: {} }, options || {});
+    opts.credentials = "same-origin";
+    if (session.token) opts.headers.Authorization = "Bearer " + session.token;
+    if (opts.json !== undefined) {
+      opts.headers["Content-Type"] = "application/json";
+      opts.body = JSON.stringify(opts.json);
+    }
+    const res = await fetch("/api" + path, opts);
+    let data = null;
+    try { data = await res.json(); } catch (_) { data = null; }
+    if (res.status === 401 && session.authRequired && !retried && !path.startsWith("/auth/")) {
+      if (await refreshSession()) return api(path, options, true);
+      session.token = null;
+      session.user = null;
+      location.hash = "#/login";
+      throw new Error("Sign in to continue");
+    }
+    if (!res.ok) {
+      const detail = data && data.detail ? (typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail)) : res.statusText;
+      throw new Error(detail || "Request failed");
+    }
+    return data;
+  }
+
+  function renderNav() {
+    const isAdmin = session.user && session.user.role === "admin";
+    document.querySelectorAll("[data-admin-only]").forEach((el) => { el.hidden = !isAdmin; });
+    const signedIn = !!session.user;
+    document.querySelectorAll("[data-signed-in]").forEach((el) => { el.hidden = !(signedIn && session.authRequired); });
+    const who = document.getElementById("who");
+    if (who) who.textContent = signedIn && session.authRequired ? session.user.email : "";
+  }
+
+  // -- sign in -------------------------------------------------------------------
+  function viewLogin() {
+    setNav("");
+    stopPolling();
+    app.innerHTML = `
+      <div class="panel" style="max-width:420px;margin:24px auto">
+        <h1>Sign in</h1>
+        <div class="row" style="margin-bottom:12px">
+          <button class="secondary" id="tabLogin" type="button">Sign in</button>
+          <button class="secondary" id="tabRegister" type="button">Create account</button>
+        </div>
+        <form id="authForm" class="stack">
+          <div><label for="a_email">Email</label><input id="a_email" type="email" autocomplete="email" required></div>
+          <div><label for="a_pass">Password</label><input id="a_pass" type="password" autocomplete="current-password" minlength="10" required></div>
+          <p class="small muted" id="authHint" style="margin:0"></p>
+          <div><button type="submit" id="authBtn">Sign in</button></div>
+        </form>
+      </div>`;
+    let mode = "login";
+    const setMode = (m) => {
+      mode = m;
+      document.getElementById("authBtn").textContent = m === "login" ? "Sign in" : "Create account";
+      document.getElementById("a_pass").autocomplete = m === "login" ? "current-password" : "new-password";
+      document.getElementById("authHint").textContent = m === "login" ? "" : "Passwords need at least 10 characters.";
+    };
+    document.getElementById("tabLogin").addEventListener("click", () => setMode("login"));
+    document.getElementById("tabRegister").addEventListener("click", () => setMode("register"));
+    setMode("login");
+    document.getElementById("authForm").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const body = { email: document.getElementById("a_email").value, password: document.getElementById("a_pass").value };
+      try {
+        const data = await api(mode === "login" ? "/auth/login" : "/auth/register", { method: "POST", json: body });
+        session.token = data.access_token;
+        session.user = data.user;
+        renderNav();
+        location.hash = "#/projects";
+        if (location.hash === "#/projects") route();
+      } catch (err) { toast(err.message); }
+    });
+  }
+
+  // -- account -------------------------------------------------------------------
+  function viewAccount() {
+    setNav("account");
+    stopPolling();
+    app.innerHTML = `
+      <h1>Account</h1>
+      <div class="panel stack">
+        <p>Signed in as <strong>${esc(session.user ? session.user.email : "local profile")}</strong>
+          ${session.user ? `(${esc(session.user.role)})` : ""}</p>
+        ${session.authRequired ? `
+        <form id="pwForm" class="stack">
+          <h2>Change password</h2>
+          <div><label for="pw_old">Current password</label><input id="pw_old" type="password" autocomplete="current-password" required></div>
+          <div><label for="pw_new">New password</label><input id="pw_new" type="password" autocomplete="new-password" minlength="10" required></div>
+          <div><button type="submit">Change password</button></div>
+        </form>
+        <div><button class="secondary" id="logoutBtn" type="button">Sign out</button></div>` : `<p class="muted">Sign-in is turned off in this mode. The app runs as a single local profile.</p>`}
+      </div>`;
+    if (session.authRequired) {
+      document.getElementById("pwForm").addEventListener("submit", async (ev) => {
+        ev.preventDefault();
+        try {
+          const r = await api("/auth/change-password", { method: "POST", json: {
+            current_password: document.getElementById("pw_old").value,
+            new_password: document.getElementById("pw_new").value,
+          }});
+          toast(r.message);
+          ev.target.reset();
+        } catch (err) { toast(err.message); }
+      });
+      document.getElementById("logoutBtn").addEventListener("click", signOut);
+    }
+  }
+
+  async function signOut() {
+    try { await api("/auth/logout", { method: "POST" }); } catch (_) { /* already signed out */ }
+    session.token = null;
+    session.user = null;
+    renderNav();
+    location.hash = "#/login";
+  }
+
+  // -- administration ------------------------------------------------------------
+  async function viewAdmin() {
+    setNav("admin");
+    stopPolling();
+    const [users, stats, backups] = await Promise.all([
+      api("/admin/users"), api("/admin/stats"), api("/admin/backups"),
+    ]);
+    const statLines = [
+      ["Users", stats.users], ["Projects", stats.projects], ["Clips ready", stats.clips_done],
+      ["Providers", stats.providers], ["Stored uploads (MB)", stats.stored_upload_mb],
+    ].map(([k, v]) => `<div class="panel"><div class="small muted">${esc(k)}</div><div style="font-size:1.4rem;font-weight:700">${esc(v)}</div></div>`).join("");
+    const jobs = Object.entries(stats.jobs_by_status).map(([k, v]) => `${esc(k)}: ${v}`).join(" · ") || "none";
+
+    app.innerHTML = `
+      <h1>Administration</h1>
+      <div class="grid">${statLines}</div>
+      <p class="small muted">Jobs: ${jobs}</p>
+
+      <section class="panel">
+        <h2>Users</h2>
+        <div style="overflow-x:auto"><table><thead><tr><th>Email</th><th>Role</th><th>Projects</th><th>Status</th><th></th></tr></thead><tbody>
+          ${users.users.map((u) => `<tr>
+            <td>${esc(u.email)}</td>
+            <td><select data-role="${esc(u.id)}">
+              <option value="user" ${u.role === "user" ? "selected" : ""}>User</option>
+              <option value="admin" ${u.role === "admin" ? "selected" : ""}>Admin</option></select></td>
+            <td>${esc(u.projects)}</td>
+            <td>${u.disabled ? "<span class='badge failed'>Disabled</span>" : "<span class='badge done'>Active</span>"}</td>
+            <td><button class="secondary" data-disable="${esc(u.id)}" data-state="${u.disabled ? 0 : 1}">${u.disabled ? "Enable" : "Disable"}</button></td>
+          </tr>`).join("")}
+        </tbody></table></div>
+      </section>
+
+      <section class="panel stack">
+        <div class="row" style="justify-content:space-between">
+          <h2 style="margin:0">Backups</h2>
+          <button id="backupBtn">Back up now</button>
+        </div>
+        <p class="small muted">Backups include the database, settings, and effect manifests. They never include the master key. Keep a copy of the master key somewhere safe, separately.</p>
+        <ul class="check-list">${backups.backups.map((b) => `<li>${esc(b.name)} <span class="small muted">${(b.size / 1024).toFixed(0)} KB · ${esc(b.created)}</span></li>`).join("") || "<li class='muted'>No backups yet.</li>"}</ul>
+      </section>`;
+
+    app.querySelectorAll("[data-role]").forEach((sel) => sel.addEventListener("change", async () => {
+      try { await api(`/admin/users/${encodeURIComponent(sel.dataset.role)}`, { method: "PATCH", json: { role: sel.value } }); toast("Role updated"); }
+      catch (err) { toast(err.message); viewAdmin(); }
+    }));
+    app.querySelectorAll("[data-disable]").forEach((btn) => btn.addEventListener("click", async () => {
+      try { await api(`/admin/users/${encodeURIComponent(btn.dataset.disable)}`, { method: "PATCH", json: { disabled: btn.dataset.state === "1" } }); viewAdmin(); }
+      catch (err) { toast(err.message); }
+    }));
+    document.getElementById("backupBtn").addEventListener("click", async () => {
+      try { const r = await api("/admin/backups", { method: "POST" }); toast("Backup written: " + r.name); viewAdmin(); }
+      catch (err) { toast(err.message); }
+    });
+  }
+
   // -- router --------------------------------------------------------------------
   async function route() {
+    renderNav();
     const hash = location.hash || "#/projects";
+    if (session.authRequired && !session.user && hash !== "#/login") {
+      location.hash = "#/login";
+      return;
+    }
     try {
+      if (hash === "#/login") return viewLogin();
       if (hash.startsWith("#/project/")) return await viewProject(decodeURIComponent(hash.slice("#/project/".length)));
       if (hash === "#/new") return await viewNew();
       if (hash === "#/setup") return await viewSetup();
+      if (hash === "#/account") return viewAccount();
+      if (hash === "#/admin") return await viewAdmin();
       stopPolling();
       return await viewProjects();
     } catch (err) {
@@ -493,6 +671,25 @@
     }
   }
 
-  window.addEventListener("hashchange", route);
-  route();
+  async function boot() {
+    try {
+      const me = await fetch("/api/auth/me", { credentials: "same-origin" });
+      if (me.status === 401) {
+        session.authRequired = true;
+        if (!(await refreshSession())) { session.user = null; }
+      } else {
+        const data = await me.json();
+        session.authRequired = !!data.auth_required;
+        session.user = data.user;
+      }
+    } catch (_) {
+      session.user = null;
+    }
+    if (!session.authRequired) renderNav();
+    window.addEventListener("hashchange", route);
+    document.getElementById("signOut").addEventListener("click", signOut);
+    route();
+  }
+
+  boot();
 })();

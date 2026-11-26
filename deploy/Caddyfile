@@ -1,0 +1,12 @@
+# Caddy terminates HTTPS (certificates are issued automatically) and forwards to the app.
+# Replace clips.example.com with your domain. Point its DNS record at the server first.
+clips.example.com {
+    encode gzip
+    request_body {
+        max_size 2GB
+    }
+    reverse_proxy 127.0.0.1:8000 {
+        # Video previews are large. Stream them without buffering the whole file.
+        flush_interval -1
+    }
+}

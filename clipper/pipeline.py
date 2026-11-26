@@ -235,10 +235,10 @@ def handle_plan(svc: Services, job: dict) -> None:
              dumps(m.effects), now, now),
         ))
     svc.db.run_many(statements)
-    svc.set_project(
-        pid, status="rendering", provider_used=used, progress=0.0,
-        status_message=f"Rendering {len(clip_ids)} clips",
-    )
+    message = f"Rendering {len(clip_ids)} clips"
+    if len(clip_ids) < p["clip_count"]:
+        message += (f" (only {len(clip_ids)} of {p['clip_count']} fit without overlapping in this video)")
+    svc.set_project(pid, status="rendering", provider_used=used, progress=0.0, status_message=message)
     for clip_id in clip_ids:
         svc.queue.enqueue(job["user_id"], pid, "render", {"clip_id": clip_id})
 

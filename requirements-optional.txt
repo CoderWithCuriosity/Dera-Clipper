@@ -4,3 +4,5 @@
 # psycopg[binary]>=3.1     PostgreSQL (multi-user)
 # yt-dlp                    link downloads from video platforms (check platform terms first)
 # pytest                    tests
+# Real local transcription (Windows/Linux). av is pinned because newer PyAV releases break faster-whisper 1.2.
+# faster-whisper>=1.0,<2 and av>=11,<17

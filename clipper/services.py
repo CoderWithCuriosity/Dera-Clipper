@@ -118,6 +118,13 @@ def build_transcription_provider(svc: "Services", row: dict):
     preset = TRANSCRIPTION_PRESETS.get(row["preset"])
     if preset is None:
         raise ValueError(f"unknown transcription preset {row['preset']}")
+    if row["preset"] == "aws_transcribe":
+        from .transcription.aws import AWSTranscribe
+
+        if svc.settings.storage != "s3" or not svc.settings.s3_bucket:
+            raise ValueError("AWS Transcribe needs S3 storage (CLIPPER_STORAGE=s3 and a bucket)")
+        return AWSTranscribe(storage=svc.storage, region=svc.settings.s3_region,
+                             bucket=svc.settings.s3_bucket, prefix=svc.settings.s3_prefix)
     api_key = decrypt_secret(svc.settings, row["api_key_enc"]) if row.get("api_key_enc") else None
     return WhisperAPI(
         name=row["id"], base_url=row.get("base_url") or preset["base_url"],
@@ -148,10 +155,14 @@ class JobQueue:
         return job_id
 
     def claim(self) -> Optional[dict]:
+        """Take the oldest queued job whose owner is still under their concurrency limit, so one
+        heavy user cannot hold every worker."""
         db = self.svc.db
         candidate = db.one(
-            "SELECT id FROM jobs WHERE status = 'queued' AND run_after <= ? ORDER BY created_at LIMIT 1",
-            (now_iso(),),
+            "SELECT j.id FROM jobs j WHERE j.status = 'queued' AND j.run_after <= ? AND "
+            "(SELECT COUNT(*) FROM jobs r WHERE r.user_id = j.user_id AND r.status = 'running') < ? "
+            "ORDER BY j.created_at LIMIT 1",
+            (now_iso(), self.svc.settings.max_running_jobs_per_user),
         )
         if not candidate:
             return None

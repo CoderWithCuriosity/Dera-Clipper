@@ -1,0 +1,9 @@
+.git
+.venv
+data
+__pycache__
+*.pyc
+.env
+.pytest_cache
+effects/**/sfx
+effects/**/broll

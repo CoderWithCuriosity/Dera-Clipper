@@ -1,0 +1,19 @@
+# systemd unit for a VPS. Copy to /etc/systemd/system/clipper.service, then:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now clipper
+[Unit]
+Description=AI Clipper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=clipper
+WorkingDirectory=/opt/clipper
+EnvironmentFile=/etc/clipper/clipper.env
+ExecStart=/opt/clipper/.venv/bin/python -m clipper serve
+Restart=on-failure
+RestartSec=5
+# The master key file and the database are readable by this user only.
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

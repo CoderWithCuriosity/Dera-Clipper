@@ -24,6 +24,11 @@ TRANSCRIPTION_PRESETS = {
         "model": "whisper-1", "key_required": True,
         "docs": "https://platform.openai.com/docs/guides/rate-limits",
     },
+    "aws_transcribe": {
+        # No key: AWS credentials come from the instance role. Needs S3 storage.
+        "label": "AWS Transcribe", "base_url": None, "model": "transcribe", "key_required": False,
+        "docs": "https://aws.amazon.com/transcribe/pricing/",
+    },
 }
 
 
