@@ -139,9 +139,6 @@ class Ffmpeg:
         video = f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1"
         if mirror:
             video += ",hflip"
-        if captions:
-            (work_dir / "captions.ass").write_text(captions, encoding="utf-8")
-            video += ",subtitles=captions.ass"
         chains.append(video + "[vbase]")
         last_video = "[vbase]"
 
@@ -152,20 +149,22 @@ class Ffmpeg:
             inputs += ["-i", str(effect.path)]
             label_in = f"[{index}:v]"
             shown = max(0.5, min(effect.duration or 3.0, 3.0))
-            box_w = int(width * 0.38)
             chains.append(
                 f"{label_in}trim=0:{shown:.3f},setpts=PTS-STARTPTS,"
-                f"scale={box_w}:-2,format=yuva420p[b{n}]"
+                f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1[b{n}]"
             )
             out = f"[vb{n}]"
-            # Top third of the frame, so B-roll never covers the captions at the bottom.
-            x = width - box_w - int(width * 0.04)
-            y = int(height * 0.06)
+            # The B-roll fills the frame for a moment. Captions are drawn after it, so they stay visible.
             chains.append(
-                f"{last_video}[b{n}]overlay={x}:{y}:enable='between(t,{effect.at:.3f},{effect.at + shown:.3f})'{out}"
+                f"{last_video}[b{n}]overlay=0:0:enable='between(t,{effect.at:.3f},{effect.at + shown:.3f})'{out}"
             )
             last_video = out
             index += 1
+        if captions:
+            (work_dir / "captions.ass").write_text(captions, encoding="utf-8")
+            chains.append(f"{last_video}subtitles=captions.ass[vcap]")
+            last_video = "[vcap]"
+
         filter_parts = list(chains)
         map_audio: list[str] = []
 

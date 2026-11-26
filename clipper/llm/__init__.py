@@ -42,7 +42,7 @@ class LLMResult:
 PRESETS: dict[str, dict[str, Any]] = {
     "groq": {
         "label": "Groq", "kind": "openai", "base_url": "https://api.groq.com/openai/v1",
-        "model": "llama-3.3-70b-versatile", "key_required": True,
+        "model": "openai/gpt-oss-20b", "key_required": True,
         "docs": "https://console.groq.com/docs/rate-limits",
     },
     "gemini": {
@@ -117,7 +117,8 @@ class LLMProvider:
         raise NotImplementedError
 
     def test(self) -> str:
-        result = self.complete("You are a connection test.", "Reply with the JSON object {\"ok\": true}.", 50)
+        # Reasoning models spend output tokens on thinking first, so leave room for the answer.
+        result = self.complete("You are a connection test.", "Reply with the JSON object {\"ok\": true}.", 400)
         extract_json(result.content)
         return "Connection OK"
 

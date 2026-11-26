@@ -4,6 +4,7 @@ keys are stored in the app."""
 from __future__ import annotations
 
 import logging
+import mimetypes
 import shutil
 from pathlib import Path
 from typing import Optional
@@ -43,7 +44,9 @@ class S3Storage:
         self.client.head_bucket(Bucket=self.bucket)
 
     def put_file(self, key: str, src: Path) -> None:
-        self.client.upload_file(str(src), self.bucket, self._key(key))
+        # Store the real content type. Without it, browsers refuse to play the video.
+        content_type = mimetypes.guess_type(str(src))[0] or "application/octet-stream"
+        self.client.upload_file(str(src), self.bucket, self._key(key), ExtraArgs={"ContentType": content_type})
 
     def exists(self, key: str) -> bool:
         from botocore.exceptions import ClientError
@@ -94,11 +97,12 @@ class S3Storage:
         if cached.is_dir():
             shutil.rmtree(cached, ignore_errors=True)
 
-    def download_url(self, key: str, filename: str) -> Optional[str]:
+    def download_url(self, key: str, filename: str, attachment: bool = True) -> Optional[str]:
+        disposition = f'attachment; filename="{filename}"' if attachment else f'inline; filename="{filename}"'
         return self.client.generate_presigned_url(
             "get_object",
-            Params={"Bucket": self.bucket, "Key": self._key(key),
-                    "ResponseContentDisposition": f'attachment; filename="{filename}"'},
+            Params={"Bucket": self.bucket, "Key": self._key(key), "ResponseContentType": "video/mp4",
+                    "ResponseContentDisposition": disposition},
             ExpiresIn=PRESIGN_SECONDS,
         )
 

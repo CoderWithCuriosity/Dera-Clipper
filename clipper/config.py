@@ -85,6 +85,8 @@ class Settings:
     backup_every_hours: int
     backup_keep: int
     maintenance: bool
+    allow_platform_links: bool
+    youtube_cookies_file: Optional[Path]
 
     @property
     def sqlite_path(self) -> Optional[Path]:
@@ -170,4 +172,8 @@ def load_settings() -> Settings:
         backup_every_hours=_int("BACKUP_EVERY_HOURS", 24 if mode != "local" else 0),
         backup_keep=_int("BACKUP_KEEP", 14),
         maintenance=_bool("MAINTENANCE", True),
+        # Off by default. YouTube's terms do not allow downloads; enable only with that accepted.
+        allow_platform_links=_bool("ALLOW_PLATFORM_LINKS", False),
+        # Optional: a cookies.txt exported from a logged-in browser, to get past YouTube's bot check.
+        youtube_cookies_file=Path(_get("YOUTUBE_COOKIES_FILE") or (data_dir / "youtube-cookies.txt")),
     )

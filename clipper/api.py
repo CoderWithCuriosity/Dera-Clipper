@@ -3,11 +3,13 @@ multi-user mode only has to change how the user is identified."""
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import threading
 import zipfile
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -18,8 +20,8 @@ from pydantic import BaseModel, Field
 
 from . import effects
 from .auth import (
-    AuthError, RateLimiter, check_password_rules, hash_password, issue_access_token, issue_refresh_token,
-    read_access_token, revoke_all, rotate_refresh_token, verify_password,
+    AuthError, RateLimiter, check_password_rules, hash_password, issue_access_token, issue_media_token,
+    issue_refresh_token, read_access_token, read_media_token, revoke_all, rotate_refresh_token, verify_password,
 )
 from .config import ROOT, Settings, load_settings
 from .db import dumps, loads, new_id, now_iso, today
@@ -30,8 +32,8 @@ from .media import ORIENTATIONS, RESOLUTIONS
 from .pipeline import handlers as pipeline_handlers
 from .transcription.cloud import TRANSCRIPTION_PRESETS
 from .security import (
-    SecurityError, check_extension, check_upload_header, decrypt_secret, encrypt_secret, safe_filename,
-    validate_link,
+    SecurityError, check_extension, check_upload_header, decrypt_secret, encrypt_secret, is_platform_link,
+    safe_filename, validate_link,
 )
 from .services import Services, build_llm_provider, start_generation
 from .storage import LocalStorage
@@ -58,6 +60,7 @@ class GenerateBody(BaseModel):
     clip_length: float = Field(gt=0)
     clip_count: int = Field(ge=1, le=20)
     mirror: bool = False
+    effects: bool = True
     captions_style: str = "classic"
     orientation: str = "landscape"
     resolution: str = "1080p"
@@ -185,6 +188,29 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
 
     user_dep = Depends(current_user)
     admin_dep = Depends(require_admin)
+
+    def _media_user(request: Request, ref: str) -> dict:
+        """Browser requests for video and downloads: a sign-in header, or a signed link for this item."""
+        header = request.headers.get("authorization", "")
+        if header.lower().startswith("bearer ") or not settings.require_auth:
+            return current_user(request)
+        token = request.query_params.get("t", "")
+        payload = read_media_token(settings, token, ref) if token else None
+        if payload is None:
+            raise HTTPException(401, "This link has expired. Refresh the page and try again.")
+        row = svc.db.one("SELECT * FROM users WHERE id = ?", (payload["sub"],))
+        if row is None or row["disabled"]:
+            raise HTTPException(401, "This account is not available")
+        return {"id": row["id"], "role": row["role"], "email": row["email"]}
+
+    def clip_media_user(request: Request, clip_id: str) -> dict:
+        return _media_user(request, f"clip:{clip_id}")
+
+    def project_media_user(request: Request, project_id: str) -> dict:
+        return _media_user(request, f"project:{project_id}")
+
+    clip_media_dep = Depends(clip_media_user)
+    project_media_dep = Depends(project_media_user)
     svc_dep = Depends(get_svc)
 
     # -- accounts ------------------------------------------------------------------
@@ -333,7 +359,7 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
     # -- health and preflight ----------------------------------------------------
     @app.get("/api/health")
     def health() -> dict:
-        return {"ok": True, "mode": settings.mode}
+        return {"ok": True, "mode": settings.mode, "platform_links": settings.allow_platform_links}
 
     @app.get("/api/preflight")
     def preflight(_admin: dict = admin_dep) -> dict:
@@ -573,6 +599,8 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
             source_type, location = "upload", safe_filename(file.filename or "video")
             file_size = size
         else:
+            if is_platform_link(url) and not settings.allow_platform_links:
+                raise HTTPException(400, "YouTube links are turned off on this server. Upload the video file instead.")
             try:
                 validate_link(url or "")
             except SecurityError as exc:
@@ -662,12 +690,12 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
         return {"clips": _clip_rows(s, project_id)}
 
     @app.get("/api/clips/{clip_id}/video")
-    def clip_video(clip_id: str, user: dict = user_dep, s: Services = svc_dep):
+    def clip_video(clip_id: str, user: dict = clip_media_dep, s: Services = svc_dep):
         clip = _clip_owned(s, clip_id, user)
         return _serve_clip(s, clip, attachment=False)
 
     @app.get("/api/clips/{clip_id}/download")
-    def clip_download(clip_id: str, user: dict = user_dep, s: Services = svc_dep):
+    def clip_download(clip_id: str, user: dict = clip_media_dep, s: Services = svc_dep):
         clip = _clip_owned(s, clip_id, user)
         return _serve_clip(s, clip, attachment=True)
 
@@ -700,7 +728,7 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
         return {"queued": True, "clip_id": clip_id}
 
     @app.get("/api/projects/{project_id}/zip")
-    def project_zip(project_id: str, user: dict = user_dep, s: Services = svc_dep):
+    def project_zip(project_id: str, user: dict = project_media_dep, s: Services = svc_dep):
         project = _owned(s, "projects", project_id, user)
         done = s.db.all(
             "SELECT * FROM clips WHERE project_id = ? AND status = 'done' ORDER BY idx", (project_id,)
@@ -778,6 +806,42 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
             ("DELETE FROM batches WHERE id = ?", (batch_id,)),
         ])
         return {"deleted": True}
+
+    # -- YouTube cookies (admin) -----------------------------------------------------
+    @app.get("/api/admin/youtube-cookies")
+    def youtube_cookies_status(_admin: dict = admin_dep) -> dict:
+        return _cookies_status(settings)
+
+    @app.post("/api/admin/youtube-cookies", status_code=201)
+    def upload_youtube_cookies(file: UploadFile = File(...), _admin: dict = admin_dep) -> dict:
+        raw = file.file.read(MAX_COOKIES_BYTES + 1)
+        if len(raw) > MAX_COOKIES_BYTES:
+            raise HTTPException(413, "That file is too large to be a cookies file")
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise HTTPException(400, "This does not look like a text cookies file")
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        if not lines or not lines[0].startswith("# ") or "Cookie File" not in lines[0]:
+            raise HTTPException(400, "Use a cookies.txt file (Netscape format), exported from your browser")
+        youtube = [ln for ln in lines if not ln.startswith("#") and "youtube.com" in ln]
+        if not youtube:
+            raise HTTPException(400, "The file has no YouTube cookies. Export it while signed in to YouTube.")
+        target = settings.youtube_cookies_file
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(".tmp")
+        tmp.write_bytes(raw)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        tmp.replace(target)
+        return _cookies_status(settings)
+
+    @app.delete("/api/admin/youtube-cookies")
+    def delete_youtube_cookies(_admin: dict = admin_dep) -> dict:
+        settings.youtube_cookies_file.unlink(missing_ok=True)
+        return _cookies_status(settings)
 
     # -- interface ---------------------------------------------------------------
     web_dir = ROOT / "web"
@@ -883,6 +947,22 @@ def _analytics(svc: Services, user_id: str) -> dict:
     }
 
 
+MAX_COOKIES_BYTES = 1024 * 1024
+
+
+def _cookies_status(settings: Settings) -> dict:
+    """Shows that a file is saved and how many YouTube cookies it holds. Never shows the contents."""
+    path = settings.youtube_cookies_file
+    if not path.is_file():
+        return {"saved": False, "youtube_cookies": 0, "saved_at": None}
+    count = 0
+    for ln in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        if ln and not ln.startswith("#") and "youtube.com" in ln:
+            count += 1
+    saved_at = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(timespec="seconds")
+    return {"saved": True, "youtube_cookies": count, "saved_at": saved_at}
+
+
 def _admin_count(s: Services) -> int:
     return s.db.one("SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND disabled = 0")["n"]
 
@@ -940,7 +1020,7 @@ def _clip_owned(svc: Services, clip_id: str, user: dict) -> dict:
 def _serve_clip(svc: Services, clip: dict, attachment: bool):
     if clip["status"] != "done" or not clip.get("output_key"):
         raise HTTPException(404, "This clip is not ready")
-    url = svc.storage.download_url(clip["output_key"], f"clip_{clip['idx']:02d}.mp4")
+    url = svc.storage.download_url(clip["output_key"], f"clip_{clip['idx']:02d}.mp4", attachment=attachment)
     if url:
         return RedirectResponse(url)
     path = svc.storage.local_path(clip["output_key"])
@@ -998,8 +1078,13 @@ def _provider_view(row: dict, usage: Optional[dict]) -> dict:
     }
 
 
+def _media_link(svc: Services, user_id: str, ref: str, path: str) -> str:
+    return f"{path}?t={issue_media_token(svc.settings, user_id, ref)}"
+
+
 def _clip_rows(svc: Services, project_id: str) -> list[dict]:
     rows = svc.db.all("SELECT * FROM clips WHERE project_id = ? ORDER BY idx", (project_id,))
+    owner = svc.db.one("SELECT user_id FROM projects WHERE id = ?", (project_id,))["user_id"]
     out = []
     for r in rows:
         out.append({
@@ -1008,8 +1093,8 @@ def _clip_rows(svc: Services, project_id: str) -> list[dict]:
             "score": r["score"], "reason": r["reason"], "status": r["status"], "error": r["error"],
             "provider_used": r["provider_used"], "settings": loads(r["settings_json"], {}),
             "effects": loads(r["effects_json"], []), "views": r["views"], "likes": r["likes"],
-            "video_url": f"/api/clips/{r['id']}/video" if r["status"] == "done" else None,
-            "download_url": f"/api/clips/{r['id']}/download" if r["status"] == "done" else None,
+            "video_url": _media_link(svc, owner, f"clip:{r['id']}", f"/api/clips/{r['id']}/video") if r["status"] == "done" else None,
+            "download_url": _media_link(svc, owner, f"clip:{r['id']}", f"/api/clips/{r['id']}/download") if r["status"] == "done" else None,
         })
     return out
 
@@ -1031,6 +1116,7 @@ def _project_view(svc: Services, row: dict, with_clips: bool = True) -> dict:
         "clip_length": row["clip_length"],
         "clip_count": row["clip_count"],
         "mirror": bool(row["mirror"]),
+        "effects_enabled": bool(row.get("effects_enabled", 1)),
         "captions_style": row["captions_style"],
         "orientation": row["orientation"],
         "resolution": row["resolution"],
@@ -1040,6 +1126,7 @@ def _project_view(svc: Services, row: dict, with_clips: bool = True) -> dict:
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "has_transcript": svc.db.one("SELECT 1 AS x FROM transcripts WHERE project_id = ?", (row["id"],)) is not None,
+        "zip_url": _media_link(svc, row["user_id"], f"project:{row['id']}", f"/api/projects/{row['id']}/zip"),
     }
     if with_clips:
         view["clips"] = _clip_rows(svc, row["id"])

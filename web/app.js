@@ -84,6 +84,10 @@
   async function viewNew() {
     setNav("new");
     const themes = (await api("/themes")).themes;
+    const health = await api("/health");
+    const youtubeNote = health.platform_links
+      ? `<p class="notice small" style="margin:8px 0 0">YouTube links are on for this server. Use them only for videos you own or have permission to process. YouTube's terms do not allow downloads, so this may stop working if YouTube blocks the server.</p>`
+      : "";
     app.innerHTML = `
       <h1>New project</h1>
       <form id="newForm" class="panel stack">
@@ -99,7 +103,7 @@
         <div>
           <label for="url">Link to a video file</label>
           <input id="url" name="url" type="url" placeholder="https://example.com/video.mp4">
-          <p class="small muted">Only use links to content you own or have permission to process. Links to web pages that are not direct video files will be rejected.</p>
+          <p class="small muted">Only use links to content you own or have permission to process. Links to web pages that are not direct video files will be rejected.</p>${youtubeNote}
         </div>
         <label class="check"><input id="rights" type="checkbox"> I own this content or have permission to process it.</label>
         <div class="row">
@@ -190,6 +194,7 @@
               </select></div>
           </div>
           <label class="check"><input id="mirror" type="checkbox" ${current.mirror ? "checked" : ""}> Mirror the video</label>
+          <label class="check"><input id="effects" type="checkbox" ${project.effects_enabled !== false ? "checked" : ""}> Add sound effects and B-roll</label>
           <div class="row">
             <button type="submit">${project.clips && project.clips.length ? "Regenerate clips" : "Generate clips"}</button>
             <span class="small muted">Generation uses the first available language model, then falls back to the next one.</span>
@@ -238,7 +243,7 @@
           ${project.error ? `<div class="notice error">${esc(project.error)}</div>` : ""}
           <div class="row">
             ${project.status === "failed" ? `<button id="retryBtn">Retry</button>` : ""}
-            ${done ? `<a class="button secondary" href="/api/projects/${esc(project.id)}/zip">Download all as zip</a>` : ""}
+            ${done ? `<a class="button secondary" href="${esc(project.zip_url)}">Download all as zip</a>` : ""}
             <button class="danger secondary" id="deleteBtn" ${active ? "disabled" : ""}>Delete project</button>
           </div>
         </div>`;
@@ -254,6 +259,7 @@
               clip_length: Number(document.getElementById("clip_length").value),
               clip_count: Number(document.getElementById("clip_count").value),
               mirror: document.getElementById("mirror").checked,
+              effects: document.getElementById("effects").checked,
               captions_style: document.getElementById("captions_style").value,
               orientation: document.getElementById("orientation").value,
               resolution: document.getElementById("resolution").value,
@@ -404,6 +410,17 @@
         </form>
       </section>
 
+      <section class="panel stack" id="ytCookies">
+        <h2>YouTube cookies</h2>
+        <p class="muted small">Needed only if you use YouTube links, and only when YouTube asks the server to prove it's not a bot. Export a cookies.txt file from your browser while signed in to YouTube, then upload it here. It's stored privately on the server and never shown again.</p>
+        <p id="ytStatus" class="small"></p>
+        <div class="row">
+          <input id="ytFile" type="file" accept=".txt,text/plain" style="max-width:340px">
+          <button id="ytUpload">Upload cookies</button>
+          <button class="danger secondary" id="ytRemove">Remove</button>
+        </div>
+      </section>
+
       <section class="panel stack">
         <div class="row" style="justify-content:space-between">
           <h2 style="margin:0">Effect library</h2>
@@ -455,6 +472,27 @@
         toast("Provider saved");
         viewSetup();
       } catch (err) { toast(err.message); }
+    });
+
+    const showYt = async () => {
+      const st = await api("/admin/youtube-cookies");
+      document.getElementById("ytStatus").innerHTML = st.saved
+        ? `Saved on ${esc(st.saved_at)} · ${st.youtube_cookies} YouTube cookies`
+        : "No cookies saved yet.";
+    };
+    showYt();
+    document.getElementById("ytUpload").addEventListener("click", async () => {
+      const f = document.getElementById("ytFile").files[0];
+      if (!f) { toast("Choose the cookies.txt file first"); return; }
+      const form = new FormData();
+      form.append("file", f);
+      try { await api("/admin/youtube-cookies", { method: "POST", body: form }); toast("Cookies saved"); showYt(); }
+      catch (err) { toast(err.message); }
+    });
+    document.getElementById("ytRemove").addEventListener("click", async () => {
+      if (!confirm("Remove the saved YouTube cookies?")) return;
+      try { await api("/admin/youtube-cookies", { method: "DELETE" }); toast("Cookies removed"); showYt(); }
+      catch (err) { toast(err.message); }
     });
 
     document.getElementById("rescanBtn").addEventListener("click", async () => {
@@ -755,6 +793,7 @@
           <div><label for="bs_caps">Captions</label><select id="bs_caps">${optionList(CAPTION_OPTIONS, cur.captions_style || v.default_captions_style)}</select></div>
         </div>
         <label class="check"><input id="bs_mirror" type="checkbox" ${cur.mirror ? "checked" : ""}> Mirror the video</label>
+        <label class="check"><input id="bs_effects" type="checkbox" ${cur.effects === false ? "" : "checked"}> Add sound effects and B-roll</label>
         <div class="row">
           <button type="submit">Save and generate for every ready video</button>
           <span class="small muted">Videos still transcribing will start as soon as they are ready.</span>
@@ -801,6 +840,7 @@
           resolution: document.getElementById("bs_res").value,
           captions_style: document.getElementById("bs_caps").value,
           mirror: document.getElementById("bs_mirror").checked,
+          effects: document.getElementById("bs_effects").checked,
         }});
         toast(`Started for ${r.applied} videos${r.waiting ? `, ${r.waiting} will start when ready` : ""}${r.errors.length ? `. ${r.errors.length} could not start: ${r.errors[0]}` : ""}`);
         viewBatch(id);

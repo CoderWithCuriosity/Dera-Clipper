@@ -12,3 +12,4 @@ effects/**/broll/**
 !effects/**/sfx/.gitkeep
 !effects/**/broll/.gitkeep
 node_modules/
+*cookies*.txt

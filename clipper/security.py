@@ -72,6 +72,15 @@ def _is_public_ip(address: str) -> bool:
     )
 
 
+PLATFORM_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
+
+
+def is_platform_link(url: str) -> bool:
+    """True for links that need yt-dlp (YouTube), rather than a direct file download."""
+    host = (urlparse((url or "").strip()).hostname or "").lower()
+    return host in PLATFORM_HOSTS
+
+
 def validate_link(url: str) -> str:
     """Accept only http(s) URLs whose host resolves exclusively to public addresses.
     This blocks requests to the server's own network (SSRF)."""

@@ -61,7 +61,7 @@ class LocalStorage:
         elif path.exists():
             path.unlink()
 
-    def download_url(self, key: str, filename: str) -> Optional[str]:
+    def download_url(self, key: str, filename: str, attachment: bool = True) -> Optional[str]:
         return None  # served by the API itself
 
     def list_keys(self, prefix: str) -> list[str]:

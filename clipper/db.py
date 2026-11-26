@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS projects (
     clip_count INTEGER,
     mirror INTEGER NOT NULL DEFAULT 0,
     captions_style TEXT NOT NULL DEFAULT 'classic',
+    effects_enabled INTEGER NOT NULL DEFAULT 1,
     orientation TEXT NOT NULL DEFAULT 'landscape',
     resolution TEXT NOT NULL DEFAULT '1080p',
     transcription_mode TEXT NOT NULL DEFAULT 'local',  -- local | cloud
@@ -193,6 +194,7 @@ class Database:
         else:
             raise ValueError(f"Unsupported DATABASE_URL: {url}")
         self.init_schema()
+        self._migrate()
 
     # -- connections -------------------------------------------------------
     @contextmanager
@@ -234,6 +236,18 @@ class Database:
             else:  # pragma: no cover
                 for stmt in [s for s in SCHEMA.split(";") if s.strip()]:
                     conn.execute(stmt)
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a database was first created."""
+        additions = [("projects", "effects_enabled", "INTEGER NOT NULL DEFAULT 1")]
+        with self._conn() as conn:
+            for table, column, decl in additions:
+                if self.kind == "sqlite":
+                    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+                    if column not in cols:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+                else:  # pragma: no cover
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {decl}")
 
     # -- helpers -----------------------------------------------------------
     def one(self, sql: str, params: tuple = ()) -> Optional[dict]:

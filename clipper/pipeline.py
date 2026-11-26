@@ -14,7 +14,7 @@ import httpx
 from .db import dumps, loads, new_id, now_iso
 from .media import MediaError, frame_size
 from .planner import HEURISTIC, plan_moments
-from .security import SecurityError, check_upload_header, validate_link
+from .security import SecurityError, check_upload_header, is_platform_link, validate_link
 from .services import Services
 from .transcription import Transcript, TranscriptionError
 
@@ -53,6 +53,44 @@ def _load_transcript(svc: Services, project_id: str) -> Optional[Transcript]:
 def build_transcription_chain(svc: Services, user_id: str, mode: str) -> list:
     """Ordered (name, engine) pairs. Each one is tried until one succeeds."""
     return svc.transcription_chain(user_id, mode)
+
+
+def download_platform_link(url: str, work: Path, ffmpeg_location: str, max_bytes: int,
+                           cookies_file: Optional[Path] = None) -> Path:
+    """Download a YouTube video with yt-dlp. Only a single video is taken (never a playlist),
+    capped at 1080p and at the upload size limit. Runs only when the operator has enabled it."""
+    try:
+        import yt_dlp
+    except ImportError as exc:
+        raise MediaError("yt-dlp is not installed on this server. Run: pip install yt-dlp") from exc
+    template = str(work / "platform.%(ext)s")
+    options = {
+        # YouTube serves video and audio as separate streams, so merge them (needs FFmpeg).
+        "format": "bv*[ext=mp4][height<=1080]+ba[ext=m4a]/bv*[height<=1080]+ba/b[height<=1080]/b",
+        "merge_output_format": "mp4",
+        "outtmpl": template,
+        "noplaylist": True,
+        "max_filesize": max_bytes,
+        "ffmpeg_location": ffmpeg_location,
+        "retries": 2,
+        "socket_timeout": 60,
+        "quiet": True,
+        "no_progress": True,
+        "no_warnings": True,
+        "restrictfilenames": True,
+    }
+    if cookies_file and cookies_file.is_file():
+        options["cookiefile"] = str(cookies_file)
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            ydl.download([url])
+    except yt_dlp.utils.DownloadError as exc:
+        raise MediaError("YouTube did not return this video: " + str(exc).replace("ERROR: ", "")[:240]) from exc
+    found = sorted(work.glob("platform.*"))
+    found = [f for f in found if f.suffix.lower() in (".mp4", ".mov", ".webm", ".mkv")]
+    if not found:
+        raise MediaError("The download finished but no video file was found")
+    return found[0]
 
 
 def download_link(url: str, dst: Path, max_bytes: int) -> None:
@@ -99,12 +137,23 @@ def handle_download(svc: Services, job: dict) -> None:
     work = _work_dir(svc, pid)
 
     if p["source_type"] == "link":
-        svc.set_project(pid, status="acquiring", status_message="Downloading the video")
-        ext = Path(unquote(urlparse(p["source_location"]).path)).suffix.lower()
+        max_bytes = svc.settings.upload_max_mb * 1024 * 1024
+        if is_platform_link(p["source_location"]):
+            if not svc.settings.allow_platform_links:
+                raise MediaError("YouTube links are turned off on this server")
+            svc.set_project(pid, status="acquiring", status_message="Downloading from YouTube")
+            local = download_platform_link(p["source_location"], work, svc.require_ffmpeg().binary, max_bytes,
+                                                   svc.settings.youtube_cookies_file)
+            ext = local.suffix.lower()
+        else:
+            svc.set_project(pid, status="acquiring", status_message="Downloading the video")
+            ext = Path(unquote(urlparse(p["source_location"]).path)).suffix.lower()
+            if ext not in (".mp4", ".mov", ".webm", ".mkv"):
+                ext = ".mp4"
+            local = work / f"source{ext}"
+            download_link(p["source_location"], local, max_bytes)
         if ext not in (".mp4", ".mov", ".webm", ".mkv"):
-            ext = ".mp4"
-        local = work / f"source{ext}"
-        download_link(p["source_location"], local, svc.settings.upload_max_mb * 1024 * 1024)
+            raise MediaError(f"The downloaded file type {ext} is not supported")
         try:
             check_upload_header(local, ext)
         except SecurityError as exc:
@@ -112,6 +161,7 @@ def handle_download(svc: Services, job: dict) -> None:
         key = f"uploads/{pid}/source{ext}"
         svc.storage.put_file(key, local)
         svc.set_project(pid, source_key=key)
+        p = _project(svc, pid)  # reload: the storage key was just saved
     else:
         svc.set_project(pid, status="acquiring", status_message="Checking the upload")
         if not p.get("source_key"):
@@ -230,10 +280,14 @@ def handle_plan(svc: Services, job: dict) -> None:
 
     from .effects import finalize_placements
 
-    finalize_placements(
-        svc, p["theme"], moments, transcript,
-        language_model_answered=used != HEURISTIC, seed=pid,
-    )
+    if p.get("effects_enabled", 1):
+        finalize_placements(
+            svc, p["theme"], moments, transcript,
+            language_model_answered=used != HEURISTIC, seed=pid,
+        )
+    else:
+        for m in moments:
+            m.effects = []
 
     svc.db.run("DELETE FROM clips WHERE project_id = ?", (pid,))
     settings_snapshot = dumps({
@@ -263,6 +317,8 @@ def handle_plan(svc: Services, job: dict) -> None:
 
 def _effects_catalog(svc: Services, project: dict) -> list[dict]:
     """Effects available for the project's theme. Filled in by the effect library."""
+    if not project.get("effects_enabled", 1):
+        return []
     from .effects import catalog_for_planner
 
     return catalog_for_planner(svc, project["theme"]) if project.get("theme") else []

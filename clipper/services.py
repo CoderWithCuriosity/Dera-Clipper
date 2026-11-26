@@ -133,6 +133,7 @@ def start_generation(svc: "Services", project: dict, opts: dict) -> None:
     svc.set_project(
         project["id"], theme=theme, clip_length=clip_length, clip_count=clip_count,
         mirror=1 if opts.get("mirror") else 0, captions_style=captions, orientation=orientation,
+        effects_enabled=1 if opts.get("effects", True) else 0,
         resolution=resolution, error=None, status="planning", status_message="Queued for planning", progress=0.0,
     )
     svc.queue.enqueue(project["user_id"], project["id"], "plan")

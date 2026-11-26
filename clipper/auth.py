@@ -85,7 +85,16 @@ def issue_access_token(settings: Settings, user: dict) -> str:
     return f"{body}.{sig}"
 
 
-def read_access_token(settings: Settings, token: str) -> Optional[dict]:
+MEDIA_TTL_SECONDS = 3600
+
+
+def _sign(settings: Settings, payload: dict) -> str:
+    body = _b64(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    sig = _b64(hmac.new(_signing_key(settings), body.encode("ascii"), hashlib.sha256).digest())
+    return f"{body}.{sig}"
+
+
+def _verify(settings: Settings, token: str) -> Optional[dict]:
     try:
         body, sig = token.split(".", 1)
     except ValueError:
@@ -97,7 +106,28 @@ def read_access_token(settings: Settings, token: str) -> Optional[dict]:
         payload = json.loads(_unb64(body))
     except (ValueError, TypeError):
         return None
-    if int(payload.get("exp", 0)) < time.time():
+    if not isinstance(payload, dict) or int(payload.get("exp", 0)) < time.time():
+        return None
+    return payload
+
+
+def read_access_token(settings: Settings, token: str) -> Optional[dict]:
+    payload = _verify(settings, token)
+    if payload is None or payload.get("typ", "access") != "access":
+        return None
+    return payload
+
+
+def issue_media_token(settings: Settings, user_id: str, ref: str) -> str:
+    """A link for the browser's own video and download requests, which cannot send the sign-in
+    header. It only works for the one clip or project named in `ref`, and expires after an hour."""
+    return _sign(settings, {"sub": user_id, "ref": ref, "typ": "media",
+                            "exp": int(time.time()) + MEDIA_TTL_SECONDS, "jti": secrets.token_hex(6)})
+
+
+def read_media_token(settings: Settings, token: str, ref: str) -> Optional[dict]:
+    payload = _verify(settings, token)
+    if payload is None or payload.get("typ") != "media" or payload.get("ref") != ref:
         return None
     return payload
 

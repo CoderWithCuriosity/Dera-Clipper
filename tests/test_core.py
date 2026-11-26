@@ -212,3 +212,28 @@ def test_api_key_round_trip_is_encrypted(app_env):
     token = encrypt_secret(settings, "sk-secret-1234")
     assert "sk-secret" not in token
     assert decrypt_secret(settings, token) == "sk-secret-1234"
+
+
+def test_reasoning_models_get_low_effort_and_room_for_the_answer(monkeypatch):
+    from clipper.llm import openai_compat
+
+    sent = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        sent.update(json)
+        return FakeHTTP(200, {"choices": [{"message": {"content": '{"ok": true}'}}], "usage": {"total_tokens": 9}})
+
+    class FakeHTTP:
+        def __init__(self, status, body):
+            self.status_code, self._body, self.headers, self.text = status, body, {}, ""
+        def json(self):
+            return self._body
+
+    monkeypatch.setattr(openai_compat.httpx, "post", fake_post)
+    provider = openai_compat.OpenAICompatible("p", "https://api.groq.com/openai/v1", "openai/gpt-oss-20b", "k")
+    provider.test()
+    assert sent["reasoning_effort"] == "low"
+    assert sent["max_tokens"] >= 400
+    sent.clear()
+    openai_compat.OpenAICompatible("p", "https://api.groq.com/openai/v1", "llama-3.1-8b-instant", "k").complete("s", "u")
+    assert "reasoning_effort" not in sent

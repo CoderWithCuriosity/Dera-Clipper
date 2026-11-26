@@ -42,6 +42,9 @@ class OpenAICompatible(LLMProvider):
         }
         if self.json_mode:
             body["response_format"] = {"type": "json_object"}
+        if "gpt-oss" in self.model:
+            # Keep reasoning short, so most of the output budget is left for the JSON answer.
+            body["reasoning_effort"] = "low"
         url = f"{self.base_url}/chat/completions"
         try:
             resp = httpx.post(url, json=body, headers=self._headers(), timeout=self.timeout)
