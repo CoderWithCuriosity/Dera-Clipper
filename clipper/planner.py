@@ -7,6 +7,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
+from .db import loads
 from .llm import InvalidOutput, LLMProvider, run_with_fallback
 
 log = logging.getLogger("clipper.planner")
@@ -173,6 +174,32 @@ def heuristic_moments(segments: list[dict], clip_length: float, duration: float,
         if len(picks) >= count:
             break
     return picks
+
+
+def group_highlights(moments: list[Moment], per_clip: int, clip_count: int) -> list[list[Moment]]:
+    """Turn ranked moments into mixed clips of per_clip moments each.
+
+    The best moments are dealt out in turns, so every clip gets a mix of strong and weaker
+    moments instead of one clip holding all the best ones. Inside each clip the moments are
+    put back in video order, so the joined clip plays in the order things happened. Fewer
+    than clip_count clips are made when there are not enough moments for all of them."""
+    if not moments:
+        return []
+    ranked = sorted(moments, key=lambda m: m.score, reverse=True)
+    groups = max(1, min(clip_count, len(ranked) // max(1, per_clip)))
+    pool = ranked[: groups * per_clip] if len(ranked) >= groups * per_clip else ranked
+    buckets: list[list[Moment]] = [[] for _ in range(groups)]
+    for i, moment in enumerate(pool):
+        buckets[i % groups].append(moment)
+    return [sorted(b, key=lambda m: m.start) for b in buckets if b]
+
+
+def clip_parts(start: float, end: float, segments_json: Optional[str]) -> list[tuple[float, float]]:
+    """The moments a clip is made of. A normal clip has one moment: its start and end."""
+    parts = loads(segments_json, None)
+    if not parts:
+        return [(float(start), float(end))]
+    return [(float(a), float(b)) for a, b in parts]
 
 
 def plan_moments(

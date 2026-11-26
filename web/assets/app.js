@@ -6,6 +6,7 @@
   const app = document.getElementById("app");
   const session = { token: null, user: null, authRequired: false };
   let pollTimer = null;
+  let routeId = 0;  // changes on every navigation, so late results from an old page are dropped
   let toastTimer = null;
   let libSelected = null;
 
@@ -100,6 +101,7 @@
 
   function toast(message) {
     const el = document.getElementById("toast");
+    if (!el) return;
     el.innerHTML = `${icon("sparkle")}<span>${esc(message)}</span>`;
     el.hidden = false;
     clearTimeout(toastTimer);
@@ -344,20 +346,35 @@
 
   // -- projects --------------------------------------------------------------------------------
   async function viewProjects() {
+    const token = routeId;  // a newer page has replaced this one if this changes
     setNav("projects");
     stopPolling();
     setPage(`<div class="page-head"><div><span class="eyebrow">Workspace</span><h1>Projects</h1>
       <p>Each project is one long video. Open one to choose a theme and get clips.</p></div>
       <div class="page-actions"><a class="btn" href="#/new">${icon("plus")} New project</a></div></div>
-      <div id="stats" class="stats"></div><div id="list"></div>`);
+      <div id="queueBanner"></div><div id="stats" class="stats"></div><div id="list"></div>`);
+    const bannerToken = routeId;
+    api("/queue").then((q) => {
+      if (bannerToken !== routeId) return;
+      const box = document.getElementById("queueBanner");
+      if (!box || (!q.heavy_running && !q.waiting)) return;
+      const parts = [];
+      if (q.heavy_running) parts.push(`${q.heavy_running} of ${q.heavy_limit} heavy ${q.heavy_limit === 1 ? "slot is" : "slots are"} busy`);
+      if (q.waiting) parts.push(`${q.waiting} waiting`);
+      box.innerHTML = `<div class="notice" style="margin-bottom:16px">${icon("refresh")}<span><strong>The server is working.</strong> ${esc(parts.join(", "))}. Videos are handled in order, so the site stays responsive.</span></div>`;
+    }).catch(() => { /* the banner is optional */ });
     const data = await api("/projects");
     const projects = data.projects;
+    if (token !== routeId) return;
     const ready = projects.filter((p) => p.status === "done").length;
     const working = projects.filter((p) => ACTIVE.includes(p.status)).length;
-    document.getElementById("stats").innerHTML = [
+    const stats = document.getElementById("stats");
+    if (!stats || token !== routeId) return;
+    stats.innerHTML = [
       ["Projects", projects.length, "film"], ["Ready", ready, "check"], ["In progress", working, "refresh"],
     ].map(([label, value, ic]) => `<div class="card stat"><div class="row between"><span class="label">${label}</span>${icon(ic, "")}</div><div class="value mono">${value}</div></div>`).join("");
     const list = document.getElementById("list");
+    if (!list || token !== routeId) return;
     if (!projects.length) {
       list.innerHTML = emptyState("upload", "No projects yet", "Upload a video or paste a link to make your first clips.",
         `<a class="btn" href="#/new">${icon("plus")} Create a project</a>`);
@@ -378,12 +395,14 @@
   }
 
   async function viewNew() {
+    const token = routeId;  // a newer page has replaced this one if this changes
     setNav("new");
     stopPolling();
     const health = await api("/health");
     const youtubeNote = health.platform_links
       ? `<div class="notice warn">${icon("alert")}<span>YouTube links are on for this server. Use them only for videos you own or have permission to process. YouTube's terms do not allow downloads, so this may stop working if YouTube blocks the server.</span></div>`
       : "";
+    if (token !== routeId) return;
     setPage(`
       <div class="page-head"><div><span class="eyebrow">New</span><h1>New project</h1>
         <p>Add the long video you want to cut into clips. Uploads are checked before anything else happens.</p></div></div>
@@ -436,20 +455,48 @@
     });
   }
 
+  // The progress card for a project: stage, message, bar and any error.
+  function statusHtml(project) {
+    const active = ACTIVE.includes(project.status);
+    return `${stepper(project.status)}
+      <p class="small muted">${esc(project.status_message || "")}</p>
+      ${progressBar(project.progress, active)}
+      ${project.queue && !project.error ? `<div class="notice">${icon("refresh")}<span><strong>In line${project.queue.ahead ? `: ${project.queue.ahead} ${project.queue.ahead === 1 ? "video" : "videos"} ahead` : ""}.</strong> ${esc(project.queue.reason)}</span></div>` : ""}
+      ${project.error ? `<div class="notice error">${icon("alert")}<span>${esc(project.error)}</span></div>` : ""}`;
+  }
+
   async function viewProject(id) {
     setNav("projects");
     stopPolling();
+    const token = routeId;
+    let lastSig = null;   // what the page was last drawn from
     const render = async () => {
       let project;
       try {
         project = await api("/projects/" + encodeURIComponent(id));
       } catch (err) {
+        // A failed refresh while the page is already showing keeps the page as it is. The next
+        // refresh tries again, so a short server restart does not replace the page with an error.
+        if (token !== routeId || lastSig !== null) return;
         stopPolling();
         setPage(`<div class="notice error">${icon("alert")}<span>${esc(err.message)}</span></div>`);
         return;
       }
+      if (token !== routeId) return;  // the user has moved to another page
       const active = ACTIVE.includes(project.status);
-      const [themes, s] = await Promise.all([api("/themes"), api("/settings")]);
+      // Only the progress card changes while the project works. The whole page is redrawn only
+      // when the status, the clips, or the errors change, so the form never flickers.
+      const sig = [project.status, project.has_transcript, project.theme, project.error || "",
+        (project.clips || []).map((c) => `${c.id}:${c.status}:${c.error || ""}`).join(",")].join("|");
+      if (lastSig !== null && sig === lastSig) {
+        const box = document.getElementById("statusBox");
+        if (box) box.innerHTML = statusHtml(project);
+        if (active) { if (!pollTimer) pollTimer = setInterval(render, 3000); }
+        else { stopPolling(); }
+        return;
+      }
+      lastSig = sig;
+      const [themes, s, logoRes] = await Promise.all([api("/themes"), api("/settings"), api("/logo")]);
       const v = s.values;
       const cur = {
         theme: project.theme || v.default_theme,
@@ -460,6 +507,11 @@
         resolution: project.resolution || v.default_resolution,
         mirror: project.theme ? project.mirror : v.default_mirror,
         effects: project.effects_enabled !== false,
+        mix: project.theme ? project.moments_per_clip : v.default_moments_per_clip,
+      };
+      const logoCfg = project.theme && project.logo ? project.logo : {
+        enabled: v.default_logo_on, opacity: v.default_logo_opacity, size: v.default_logo_size,
+        x: v.default_logo_x, y: v.default_logo_y,
       };
       const done = (project.clips || []).filter((c) => c.status === "done").length;
       const settingsForm = project.has_transcript ? `
@@ -471,6 +523,7 @@
             <div><label for="clip_length">Clip length (seconds)</label><input id="clip_length" type="number" min="1" step="1" max="${Math.floor(project.duration)}" value="${esc(Math.round(cur.clip_length))}" required>
               <p class="field-hint">Up to ${fmtDuration(project.duration)}</p></div>
             <div><label for="clip_count">Number of clips</label><input id="clip_count" type="number" min="1" max="20" value="${esc(cur.clip_count)}" required></div>
+            ${mixBlock("g", cur.mix)}
             <div><label for="orientation">Orientation</label><select id="orientation">
               ${[["landscape", "Landscape 16:9"], ["vertical", "Vertical 9:16"], ["square", "Square 1:1"]]
                 .map(([val, lab]) => `<option value="${val}" ${val === cur.orientation ? "selected" : ""}>${esc(lab)}</option>`).join("")}</select></div>
@@ -485,6 +538,7 @@
             <label class="check"><input id="mirror" type="checkbox" ${cur.mirror ? "checked" : ""}> Mirror the video</label>
             <label class="check"><input id="effects" type="checkbox" ${cur.effects ? "checked" : ""}> Add sound effects and B-roll</label>
           </div>
+          ${logoBlock("g", logoCfg, logoRes.logo, "#orientation")}
           <div class="row">
             <button type="submit">${icon("sparkle")} ${project.clips && project.clips.length ? "Regenerate clips" : "Generate clips"}</button>
             <span class="small muted">The first available language model picks the moments. Without one, speech density picks them.</span>
@@ -499,7 +553,7 @@
           </div>
           <div class="clip-meta">
             <div class="clip-top">
-              <div class="row" style="gap:8px"><strong>Clip ${c.idx}</strong><span class="tag">${fmtDuration(c.start)} to ${fmtDuration(c.end)}</span></div>
+              <div class="row" style="gap:8px"><strong>Clip ${c.idx}</strong><span class="tag">${c.moments > 1 ? `Mix of ${c.moments} moments · ${fmtDuration(c.length)}` : `${fmtDuration(c.start)} to ${fmtDuration(c.end)}`}</span></div>
               ${c.score != null ? `<span class="tag score">Score ${c.score.toFixed(2)}</span>` : ""}
             </div>
             <p class="clip-reason small">${esc(c.reason || "")}</p>
@@ -536,16 +590,13 @@
             <button class="danger secondary" id="deleteBtn" ${active ? "disabled" : ""}>${icon("trash")} Delete</button>
           </div>
         </div>
-        <section class="card stack" style="margin-bottom:18px">
-          ${stepper(project.status)}
-          <p class="small muted">${esc(project.status_message || "")}</p>
-          ${progressBar(project.progress, active)}
-          ${project.error ? `<div class="notice error">${icon("alert")}<span>${esc(project.error)}</span></div>` : ""}
-        </section>
+        <section class="card stack" id="statusBox" style="margin-bottom:18px">${statusHtml(project)}</section>
         ${settingsForm}
         ${clips ? `<div class="page-head" style="margin:28px 0 14px"><div><h2>Clips</h2><p>${done} of ${project.clips.length} ready</p></div></div><div class="clip-list">${clips}</div>` : ""}`);
 
       if (project.has_transcript) {
+        wireMix("g");
+        wireLogo("g", !!logoRes.logo);
         document.getElementById("genForm").addEventListener("submit", async (ev) => {
           ev.preventDefault();
           try {
@@ -558,6 +609,8 @@
               captions_style: document.getElementById("captions_style").value,
               orientation: document.getElementById("orientation").value,
               resolution: document.getElementById("resolution").value,
+              moments_per_clip: readMix("g"),
+              logo: readLogo("g"),
             }});
             toast("Generation started");
             render();
@@ -608,12 +661,139 @@
     ["landscape", "Landscape 16:9"], ["vertical", "Vertical 9:16"], ["square", "Square 1:1"],
   ];
 
+  // -- brand logo and mixed clips -----------------------------------------------------------
+  // Position is stored as x and y percentages: 0 = left or top edge, 100 = right or bottom edge.
+  const LOGO_SPOTS = {
+    tl: ["Top left", 3, 3], tc: ["Top centre", 50, 3], tr: ["Top right", 97, 3],
+    ml: ["Middle left", 3, 50], mc: ["Centre", 50, 50], mr: ["Middle right", 97, 50],
+    bl: ["Bottom left", 3, 97], bc: ["Bottom centre", 50, 97], br: ["Bottom right", 97, 97],
+  };
+  const FRAME_ASPECT = { landscape: 16 / 9, vertical: 9 / 16, square: 1 };
+  let logoUrl = null; // object URL for the saved logo, fetched once and reused
+
+  async function logoImageUrl() {
+    if (logoUrl) return logoUrl;
+    const headers = session.token ? { Authorization: "Bearer " + session.token } : {};
+    const res = await fetch("/api/logo/image", { headers, credentials: "same-origin", cache: "no-cache" });
+    if (!res.ok) return null;
+    logoUrl = URL.createObjectURL(await res.blob());
+    return logoUrl;
+  }
+
+  // The logo controls with a live preview of the frame. p keeps element ids unique on each page.
+  // orientFrom is a selector for the orientation select, so the preview follows the chosen shape.
+  function logoBlock(p, cfg, logoInfo, orientFrom) {
+    const c = Object.assign({ enabled: false, opacity: 80, size: 15, x: 97, y: 3 }, cfg || {});
+    const spots = Object.entries(LOGO_SPOTS).map(([key, [name]]) =>
+      `<button type="button" class="secondary sm" data-spot="${key}" data-prefix="${p}">${name}</button>`).join("");
+    const slider = (key, label, lo, hi, value, unit) => `
+      <div class="range-row"><label for="${p}_${key}">${label} <output id="${p}_${key}o">${value}${unit}</output></label>
+        <input type="range" id="${p}_${key}" min="${lo}" max="${hi}" step="1" value="${value}"></div>`;
+    return `
+      <div class="logo-block">
+        <div class="row" style="justify-content:space-between">
+          <h3>Brand logo</h3>
+          <label class="check"><input type="checkbox" id="${p}_on" ${c.enabled ? "checked" : ""} ${logoInfo ? "" : "disabled"}> Add my logo to the clips</label>
+        </div>
+        ${logoInfo ? "" : `<p class="field-hint">No logo yet. Upload one under Brand logo on the Setup page.</p>`}
+        <div class="logo-grid">
+          <div class="logo-stage" id="${p}_stage" ${orientFrom ? `data-orient-from="${esc(orientFrom)}"` : ""} style="aspect-ratio:${FRAME_ASPECT.landscape}">
+            <div class="logo-mark" id="${p}_mark">${logoInfo ? `<img id="${p}_img" alt="Your logo">` : "Logo"}</div>
+          </div>
+          <div class="stack" style="margin-top:0">
+            <div class="pos-grid">${spots}</div>
+            ${slider("x", "Left to right", 0, 100, c.x, "%")}
+            ${slider("y", "Top to bottom", 0, 100, c.y, "%")}
+            ${slider("size", "Size (share of width)", 5, 50, c.size, "%")}
+            ${slider("opacity", "Opacity", 10, 100, c.opacity, "%")}
+          </div>
+        </div>
+      </div>`;
+  }
+
+  function readLogo(p) {
+    return {
+      enabled: document.getElementById(p + "_on").checked,
+      opacity: Number(document.getElementById(p + "_opacity").value),
+      size: Number(document.getElementById(p + "_size").value),
+      x: Number(document.getElementById(p + "_x").value),
+      y: Number(document.getElementById(p + "_y").value),
+    };
+  }
+
+  function paintLogo(p) {
+    const stage = document.getElementById(p + "_stage");
+    const mark = document.getElementById(p + "_mark");
+    if (!stage || !mark || !document.getElementById(p + "_xo")) return;
+    const get = (key) => Number(document.getElementById(p + "_" + key).value);
+    const from = stage.dataset.orientFrom ? document.querySelector(stage.dataset.orientFrom) : null;
+    const aspect = FRAME_ASPECT[from ? from.value : "landscape"] || FRAME_ASPECT.landscape;
+    stage.style.aspectRatio = String(aspect);
+    ["x", "y", "size", "opacity"].forEach((key) => { document.getElementById(`${p}_${key}o`).textContent = get(key) + "%"; });
+    const x = get("x"), y = get("y"), size = get("size");
+    const img = document.getElementById(p + "_img");
+    // The logo's height as a share of the frame height, from the image's own proportions.
+    const ratio = img && img.dataset.ratio ? Number(img.dataset.ratio) : 0.5;
+    const heightPct = size * aspect * ratio;
+    mark.style.width = size + "%";
+    mark.style.height = img ? "auto" : heightPct + "%";
+    mark.style.left = ((100 - size) * x / 100) + "%";
+    mark.style.top = ((100 - heightPct) * y / 100) + "%";
+    mark.style.opacity = String(get("opacity") / 100);
+  }
+
+  async function wireLogo(p, hasLogo) {
+    const repaint = () => paintLogo(p);
+    ["x", "y", "size", "opacity"].forEach((key) => document.getElementById(`${p}_${key}`).addEventListener("input", repaint));
+    app.querySelectorAll(`[data-spot][data-prefix="${p}"]`).forEach((btn) => btn.addEventListener("click", () => {
+      const [, x, y] = LOGO_SPOTS[btn.dataset.spot];
+      document.getElementById(`${p}_x`).value = x;
+      document.getElementById(`${p}_y`).value = y;
+      repaint();
+    }));
+    const from = document.getElementById(p + "_stage").dataset.orientFrom;
+    const orient = from ? document.querySelector(from) : null;
+    if (orient) orient.addEventListener("change", repaint);
+    if (hasLogo) {
+      const img = document.getElementById(p + "_img");
+      img.addEventListener("load", () => { img.dataset.ratio = img.naturalHeight / img.naturalWidth; repaint(); });
+      const url = await logoImageUrl();
+      if (url && document.getElementById(p + "_img")) document.getElementById(p + "_img").src = url;
+    }
+    repaint();
+  }
+
+  // Single moments (the normal clips) or mixed highlights (several moments joined per clip).
+  function mixBlock(p, perClip) {
+    const mixing = Number(perClip) > 1;
+    return `
+      <div><label for="${p}_mode">Clip style</label><select id="${p}_mode">
+        <option value="single" ${mixing ? "" : "selected"}>Single moments</option>
+        <option value="mix" ${mixing ? "selected" : ""}>Mixed highlights</option></select></div>
+      <div id="${p}_permwrap" ${mixing ? "" : "hidden"}><label for="${p}_per">Moments per clip</label>
+        <input type="number" id="${p}_per" min="2" max="6" step="1" value="${mixing ? Number(perClip) : 3}">
+        <p class="field-hint">Each clip joins this many moments, in the order they happen in the video. Sound effects and B-roll are added to single-moment clips only.</p></div>`;
+  }
+
+  function wireMix(p) {
+    const mode = document.getElementById(p + "_mode");
+    const sync = () => { document.getElementById(p + "_permwrap").hidden = mode.value !== "mix"; };
+    mode.addEventListener("change", sync);
+    sync();
+  }
+
+  function readMix(p) {
+    if (document.getElementById(p + "_mode").value !== "mix") return 1;
+    return Number(document.getElementById(p + "_per").value) || 3;
+  }
+
   function optionList(options, selected) {
     return options.map(([val, label]) => `<option value="${esc(val)}" ${val === selected ? "selected" : ""}>${esc(label)}</option>`).join("");
   }
 
   // -- batches ---------------------------------------------------------------------------------
   async function viewBatches() {
+    const token = routeId;  // a newer page has replaced this one if this changes
     setNav("batches");
     stopPolling();
     const data = await api("/batches");
@@ -630,6 +810,7 @@
             <div><h3>${esc(b.name)}</h3><div class="desc small muted">${b.projects} videos · ${b.settings ? "settings saved" : "no settings yet"}</div></div></div></div>
           <div class="row" style="gap:6px">${Object.entries(b.status_counts).map(([k, v]) => `<span class="badge ${(STATUS[k] || [])[1] || ""}">${esc((STATUS[k] || [k])[0])}: ${v}</span>`).join("") || `<span class="muted small">Empty</span>`}</div>
         </a>`).join("")}</div>` : emptyState("stack", "No batches yet", "Create a batch when you have several videos to process with the same settings.")}`);
+    if (token !== routeId) return;
     document.getElementById("batchForm").addEventListener("submit", async (ev) => {
       ev.preventDefault();
       try {
@@ -640,16 +821,20 @@
   }
 
   async function viewBatch(id) {
+    const token = routeId;  // a newer page has replaced this one if this changes
     setNav("batches");
     stopPolling();
-    const [batch, s, themes] = await Promise.all([
-      api("/batches/" + encodeURIComponent(id)), api("/settings"), api("/themes"),
+    const [batch, s, themes, logoRes] = await Promise.all([
+      api("/batches/" + encodeURIComponent(id)), api("/settings"), api("/themes"), api("/logo"),
     ]);
+    if (token !== routeId) return;
     const cur = batch.settings || {};
     const v = s.values;
-    const items = (batch.items || []).map((p) => `
-      <tr><td><a href="#/project/${esc(p.id)}"><strong>${esc(p.title)}</strong></a></td><td>${statusBadge(p.status)}</td>
-      <td class="small muted">${esc(p.status_message || "")}</td></tr>`).join("");
+    const batchLogo = cur.logo || {
+      enabled: v.default_logo_on, opacity: v.default_logo_opacity, size: v.default_logo_size,
+      x: v.default_logo_x, y: v.default_logo_y,
+    };
+    const items = batchRows(batch.items);
 
     setPage(`
       <div class="page-head"><div><span class="eyebrow">Batch</span><h1>${esc(batch.name)}</h1>
@@ -675,11 +860,13 @@
               <option value="1080p" ${(cur.resolution || v.default_resolution) === "1080p" ? "selected" : ""}>1080p</option>
               <option value="720p" ${(cur.resolution || v.default_resolution) === "720p" ? "selected" : ""}>720p</option></select></div>
             <div><label for="bs_caps">Captions</label><select id="bs_caps">${optionList(CAPTION_OPTIONS, cur.captions_style || v.default_captions_style)}</select></div>
+            ${mixBlock("bs", cur.moments_per_clip || v.default_moments_per_clip)}
           </div>
           <div class="toggle-row">
             <label class="check"><input id="bs_mirror" type="checkbox" ${cur.mirror ? "checked" : ""}> Mirror the video</label>
             <label class="check"><input id="bs_effects" type="checkbox" ${cur.effects === false ? "" : "checked"}> Add sound effects and B-roll</label>
           </div>
+          ${logoBlock("bs", batchLogo, logoRes.logo, "#bs_orient")}
           <div class="row"><button type="submit">${icon("sparkle")} Save and generate for ready videos</button></div>
           <p class="small muted">Videos still transcribing start as soon as they are ready.</p>
         </form>
@@ -687,7 +874,7 @@
       <section class="card" style="margin-top:18px">
         <div class="card-head"><h2>Videos</h2></div>
         <div class="table-wrap"><table><thead><tr><th>Video</th><th>Status</th><th>Detail</th></tr></thead>
-          <tbody>${items || "<tr><td colspan='3' class='muted'>No videos yet.</td></tr>"}</tbody></table></div>
+          <tbody id="batchItems">${items}</tbody></table></div>
       </section>`);
 
     wireDropzone(document.getElementById("dropBatch"));
@@ -713,6 +900,8 @@
       viewBatch(id);
     });
 
+    wireMix("bs");
+    wireLogo("bs", !!logoRes.logo);
     document.getElementById("batchSettingsForm").addEventListener("submit", async (ev) => {
       ev.preventDefault();
       try {
@@ -725,6 +914,8 @@
           captions_style: document.getElementById("bs_caps").value,
           mirror: document.getElementById("bs_mirror").checked,
           effects: document.getElementById("bs_effects").checked,
+          moments_per_clip: readMix("bs"),
+          logo: readLogo("bs"),
         }});
         toast(`Started for ${r.applied} videos${r.waiting ? `, ${r.waiting} will start when ready` : ""}${r.errors.length ? `. ${r.errors.length} could not start: ${r.errors[0]}` : ""}`);
         viewBatch(id);
@@ -737,18 +928,36 @@
       catch (err) { toast(err.message); }
     });
 
+    // While videos work, only the table is refreshed, so the forms above keep what was typed.
     if ((batch.items || []).some((p) => ACTIVE.includes(p.status))) {
-      pollTimer = setInterval(() => viewBatch(id), 4000);
+      pollTimer = setInterval(async () => {
+        try {
+          const fresh = await api("/batches/" + encodeURIComponent(id));
+          if (token !== routeId) return;
+          const body = document.getElementById("batchItems");
+          if (body) body.innerHTML = batchRows(fresh.items);
+          if (!(fresh.items || []).some((p) => ACTIVE.includes(p.status))) stopPolling();
+        } catch (_) { /* keep the page; the next refresh tries again */ }
+      }, 4000);
     }
+  }
+
+  function batchRows(items) {
+    const rows = (items || []).map((p) => `
+      <tr><td><a href="#/project/${esc(p.id)}"><strong>${esc(p.title)}</strong></a></td><td>${statusBadge(p.status)}</td>
+      <td class="small muted">${esc(p.status_message || "")}</td></tr>`).join("");
+    return rows || "<tr><td colspan='3' class='muted'>No videos yet.</td></tr>";
   }
 
   // -- analytics -------------------------------------------------------------------------------
   async function viewAnalytics() {
+    const token = routeId;  // a newer page has replaced this one if this changes
     setNav("analytics");
     stopPolling();
     const a = await api("/analytics");
     const row = (label, stats) => `<tr><td>${esc(label)}</td><td class="mono">${stats.clips}</td>
       <td class="mono">${stats.avg_views == null ? "-" : esc(stats.avg_views)}</td><td class="mono">${stats.avg_likes == null ? "-" : esc(stats.avg_likes)}</td></tr>`;
+    if (token !== routeId) return;
     const block = (title, map) => `
       <section class="card"><div class="card-head"><h2>${esc(title)}</h2></div>
         <div class="table-wrap"><table><thead><tr><th>Group</th><th>Clips</th><th>Avg views</th><th>Avg likes</th></tr></thead>
@@ -777,10 +986,12 @@
 
   // -- effect library (admin) ---------------------------------------------------------------------
   async function viewLibrary() {
+    const token = routeId;  // a newer page has replaced this one if this changes
     setNav("library");
     stopPolling();
     const data = await api("/effects");
     const themes = data.themes;
+    if (token !== routeId) return;
     if (!libSelected || !themes.some((t) => t.folder === libSelected)) libSelected = themes[0] ? themes[0].folder : null;
     const sel = themes.find((t) => t.folder === libSelected);
     const swatches = ["", "s2", "s3", "s4"];
@@ -912,12 +1123,20 @@
 
   // -- setup ------------------------------------------------------------------------------------------
   async function viewSetup() {
+    const token = routeId;  // a newer page has replaced this one if this changes
     setNav("setup");
     stopPolling();
-    const [settings, providers, models, preflight, presets, library] = await Promise.all([
+    const [settings, providers, models, preflight, presets, library, logoRes] = await Promise.all([
       api("/settings"), api("/providers"), api("/models"), api("/preflight"), api("/providers/presets"), api("/effects"),
+      api("/logo"),
     ]);
+    if (token !== routeId) return;
     const v = settings.values;
+    const logo = logoRes.logo;
+    const logoDefaults = {
+      enabled: v.default_logo_on, opacity: v.default_logo_opacity, size: v.default_logo_size,
+      x: v.default_logo_x, y: v.default_logo_y,
+    };
     const llmPresets = presets.presets;
     const transPresets = presets.transcription_presets;
 
@@ -973,12 +1192,31 @@
         </div>
       </div>
 
+      <form id="logoForm" class="card stack" style="margin-top:18px">
+        <div class="card-head"><div class="row"><div class="bubble">${icon("sparkle")}</div><div><h2>Brand logo</h2><div class="desc">Upload your logo once. It can go on every clip. You can turn it off, or move it, for each project.</div></div></div></div>
+        <div class="row" style="align-items:flex-end">
+          <div class="dropzone" id="dropLogo" style="padding:16px;flex:1 1 260px">${icon("upload")}<div class="title" style="font-size:.92rem">${logo ? "Replace the logo" : "Choose a logo"}</div>
+            <div class="field-hint">A PNG with a transparent background works best. JPG and WebP work too.</div>
+            <div class="file" data-file-name></div>
+            <input id="logoFile" type="file" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp"></div>
+          <div class="row"><button type="button" id="logoUpload">${icon("upload")} Upload</button>
+            <button type="button" class="danger secondary" id="logoRemove" ${logo ? "" : "disabled"}>${icon("trash")} Remove</button></div>
+        </div>
+        <p class="small muted">${logo ? `Current logo: ${esc(logo.name)}` : "No logo uploaded yet."}</p>
+        <div><label for="dl_orient">Preview shape</label><select id="dl_orient" style="max-width:260px">
+          ${[["landscape", "Landscape 16:9"], ["vertical", "Vertical 9:16"], ["square", "Square 1:1"]]
+            .map(([val, lab]) => `<option value="${val}" ${val === v.default_orientation ? "selected" : ""}>${esc(lab)}</option>`).join("")}</select></div>
+        ${logoBlock("dl", logoDefaults, logo, "#dl_orient")}
+        <div class="row"><button type="submit">Save logo settings</button><span class="small muted">These are the defaults for new projects.</span></div>
+      </form>
+
       <form id="defaultsForm" class="card stack" style="margin-top:18px">
         <div class="card-head"><div class="row"><div class="bubble">${icon("sliders")}</div><div><h2>Default clip settings</h2><div class="desc">Used for new projects. You can change them for each project.</div></div></div></div>
         <div class="field-grid">
           <div><label for="d_theme">Theme</label><select id="d_theme">${library.themes.map((t) => `<option ${t.name === v.default_theme ? "selected" : ""}>${esc(t.name)}</option>`).join("")}</select></div>
           <div><label for="d_len">Clip length (seconds)</label><input id="d_len" type="number" min="1" value="${esc(v.default_clip_length)}"></div>
           <div><label for="d_count">Clips per video</label><input id="d_count" type="number" min="1" max="20" value="${esc(v.default_clip_count)}"></div>
+          ${mixBlock("d", v.default_moments_per_clip)}
           <div><label for="d_orient">Orientation</label><select id="d_orient">${["landscape", "vertical", "square"].map((o) => `<option ${o === v.default_orientation ? "selected" : ""}>${o}</option>`).join("")}</select></div>
           <div><label for="d_res">Resolution</label><select id="d_res">${["1080p", "720p"].map((o) => `<option ${o === v.default_resolution ? "selected" : ""}>${o}</option>`).join("")}</select></div>
           <div><label for="d_caps">Captions</label><select id="d_caps">${["classic", "bold", "boxed", "karaoke", "off"].map((o) => `<option ${o === v.default_captions_style ? "selected" : ""}>${o}</option>`).join("")}</select></div>
@@ -1025,6 +1263,43 @@
     kindSelect.addEventListener("change", fillPresets);
     fillPresets();
 
+    // Brand logo: upload, remove, and save the placement defaults.
+    wireDropzone(document.getElementById("dropLogo"));
+    wireMix("d");
+    wireLogo("dl", !!logo);
+    document.getElementById("logoUpload").addEventListener("click", async () => {
+      const f = document.getElementById("logoFile").files[0];
+      if (!f) { toast("Choose an image first"); return; }
+      const form = new FormData();
+      form.append("file", f);
+      try {
+        await api("/logo", { method: "POST", body: form });
+        logoUrl = null;
+        toast("Logo saved");
+        viewSetup();
+      } catch (err) { toast(err.message); }
+    });
+    document.getElementById("logoRemove").addEventListener("click", async () => {
+      if (!confirm("Remove your logo? Clips made later will not have it.")) return;
+      try {
+        await api("/logo", { method: "DELETE" });
+        logoUrl = null;
+        toast("Logo removed");
+        viewSetup();
+      } catch (err) { toast(err.message); }
+    });
+    document.getElementById("logoForm").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const L = readLogo("dl");
+      try {
+        await api("/settings", { method: "PUT", json: { values: {
+          default_logo_on: L.enabled, default_logo_opacity: L.opacity, default_logo_size: L.size,
+          default_logo_x: L.x, default_logo_y: L.y,
+        }}});
+        toast("Logo settings saved");
+      } catch (err) { toast(err.message); }
+    });
+
     document.getElementById("defaultsForm").addEventListener("submit", async (ev) => {
       ev.preventDefault();
       try {
@@ -1036,6 +1311,7 @@
           default_resolution: document.getElementById("d_res").value,
           default_captions_style: document.getElementById("d_caps").value,
           default_mirror: document.getElementById("d_mirror").checked,
+          default_moments_per_clip: readMix("d"),
           transcription_mode: document.getElementById("d_tmode").value,
         }}});
         toast("Defaults saved");
@@ -1107,10 +1383,12 @@
 
   // -- administration ----------------------------------------------------------------------------------
   async function viewAdmin() {
+    const token = routeId;  // a newer page has replaced this one if this changes
     setNav("admin");
     stopPolling();
     const [users, stats, backups] = await Promise.all([api("/admin/users"), api("/admin/stats"), api("/admin/backups")]);
     const jobs = Object.entries(stats.jobs_by_status).map(([k, v]) => `${esc(k)}: ${v}`).join(" · ") || "none";
+    if (token !== routeId) return;
     const cards = [
       ["Users", stats.users, "users"], ["Projects", stats.projects, "film"], ["Clips ready", stats.clips_done, "check"],
       ["Providers", stats.providers, "sparkle"], ["Stored uploads", `${stats.stored_upload_mb} MB`, "upload"],
@@ -1157,6 +1435,7 @@
 
   // -- router --------------------------------------------------------------------------------------------
   async function route() {
+    const token = ++routeId;
     renderNav();
     const hash = location.hash || "#/projects";
     if (session.authRequired && !session.user && hash !== "#/login") {
@@ -1177,6 +1456,7 @@
       stopPolling();
       return await viewProjects();
     } catch (err) {
+      if (token !== routeId) return;
       setPage(`<div class="notice error">${icon("alert")}<span>${esc(err.message)}</span></div>`);
     }
   }

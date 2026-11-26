@@ -57,7 +57,9 @@ def merge_chunks(engine: str, language: Optional[str], parts: list[tuple[Transcr
 
 
 def build_local_engine(settings) -> TranscriptionEngine:
+    from ..media import Ffmpeg, find_ffmpeg
     from .local import LocalWhisper
 
+    binary = find_ffmpeg(settings)
     return LocalWhisper(model_name=settings.whisper_model, device=settings.whisper_device,
-                        models_dir=settings.models_dir)
+                        models_dir=settings.models_dir, ffmpeg=Ffmpeg(binary) if binary else None)

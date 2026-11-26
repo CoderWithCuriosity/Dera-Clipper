@@ -13,7 +13,7 @@ import httpx
 
 from .db import dumps, loads, new_id, now_iso
 from .media import MediaError, frame_size
-from .planner import HEURISTIC, plan_moments
+from .planner import HEURISTIC, clip_parts, group_highlights, plan_moments
 from .security import SecurityError, check_upload_header, is_platform_link, validate_link
 from .services import Services
 from .transcription import Transcript, TranscriptionError
@@ -271,16 +271,28 @@ def handle_plan(svc: Services, job: dict) -> None:
     def failure(name: str, _message: str) -> None:
         svc.record_usage(name, failed=True)
 
+    # Mixed highlights: each clip joins several moments, so the planner finds per_clip times as
+    # many moments, each one a share of the requested clip length. Single clips use the plain path.
+    per_clip = max(1, int(p.get("moments_per_clip") or 1))
+    mixed = per_clip > 1
+    if mixed:
+        moment_length, wanted = p["clip_length"] / per_clip, p["clip_count"] * per_clip
+        catalog: list[dict] = []  # sound effects and B-roll are added to single-moment clips only
+    else:
+        moment_length, wanted = p["clip_length"], p["clip_count"]
+        catalog = _effects_catalog(svc, p)
+
     moments, used = plan_moments(
-        transcript.segments, p["duration"], p["theme"], p["clip_length"], p["clip_count"],
-        providers, effects_catalog=_effects_catalog(svc, p), on_usage=usage, on_failure=failure,
+        transcript.segments, p["duration"], p["theme"], moment_length, wanted,
+        providers, effects_catalog=catalog, on_usage=usage, on_failure=failure,
     )
     if not moments:
         raise MediaError("No clip moments could be found in this video")
+    groups = group_highlights(moments, per_clip, p["clip_count"]) if mixed else [[m] for m in moments]
 
     from .effects import finalize_placements
 
-    if p.get("effects_enabled", 1):
+    if p.get("effects_enabled", 1) and not mixed:
         finalize_placements(
             svc, p["theme"], moments, transcript,
             language_model_answered=used != HEURISTIC, seed=pid,
@@ -293,23 +305,32 @@ def handle_plan(svc: Services, job: dict) -> None:
     settings_snapshot = dumps({
         "captions_style": p["captions_style"], "orientation": p["orientation"],
         "resolution": p["resolution"], "mirror": bool(p["mirror"]),
+        "logo": loads(p.get("logo_json"), None),
     })
     now = now_iso()
     clip_ids: list[str] = []
     statements = []
-    for idx, m in enumerate(moments, start=1):
+    for idx, group in enumerate(groups, start=1):
         clip_id = new_id()
         clip_ids.append(clip_id)
+        first = group[0]
+        reason = first.reason if len(group) == 1 else " · ".join(m.reason for m in group if m.reason)[:1000]
+        score = sum(m.score for m in group) / len(group)
+        segments_json = dumps([[m.start, m.end] for m in group]) if mixed else None
         statements.append((
             "INSERT INTO clips (id, project_id, idx, start_sec, end_sec, score, reason, status, provider_used, "
-            "settings_json, effects_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)",
-            (clip_id, pid, idx, m.start, m.end, m.score, m.reason, used, settings_snapshot,
-             dumps(m.effects), now, now),
+            "settings_json, effects_json, segments_json, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)",
+            (clip_id, pid, idx, min(m.start for m in group), max(m.end for m in group), round(score, 3),
+             reason, used, settings_snapshot, dumps(first.effects), segments_json, now, now),
         ))
     svc.db.run_many(statements)
     message = f"Rendering {len(clip_ids)} clips"
     if len(clip_ids) < p["clip_count"]:
-        message += (f" (only {len(clip_ids)} of {p['clip_count']} fit without overlapping in this video)")
+        if mixed:
+            message += f" (only {len(clip_ids)} of {p['clip_count']} could be built from the moments found)"
+        else:
+            message += (f" (only {len(clip_ids)} of {p['clip_count']} fit without overlapping in this video)")
     svc.set_project(pid, status="rendering", provider_used=used, progress=0.0, status_message=message)
     for clip_id in clip_ids:
         svc.queue.enqueue(job["user_id"], pid, "render", {"clip_id": clip_id})
@@ -336,33 +357,41 @@ def handle_render(svc: Services, job: dict) -> None:
     try:
         ff = svc.require_ffmpeg()
         opts = loads(clip["settings_json"], {})
-        width, height = frame_size(opts.get("orientation", "landscape"), opts.get("resolution", "1080p"))
+        orientation = opts.get("orientation", "landscape")
+        resolution = opts.get("resolution", "1080p")
+        width, height = frame_size(orientation, resolution)
+        parts = clip_parts(clip["start_sec"], clip["end_sec"], clip.get("segments_json"))
         transcript = _load_transcript(svc, pid)
         style = opts.get("captions_style", "classic")
         captions = None
         if style != "off" and transcript is not None:
-            from .media import build_captions_ass
+            from .media import build_mix_captions_ass
 
-            captions = build_captions_ass(transcript.segments, transcript.words,
-                                          clip["start_sec"], clip["end_sec"], width, height, style)
+            captions = build_mix_captions_ass(transcript.segments, transcript.words, parts, width, height, style)
         local = svc.storage.local_path(p["source_key"])
         has_audio = ff.probe(local)["has_audio"]
-        from .media import Effect
-
-        effects = [
-            Effect(path=path, kind=e["kind"], at=float(e["at"]), duration=float(e.get("duration", 0)))
-            for e, path in _resolve_effects(svc, pid, loads(clip["effects_json"], []), p["theme"],
-                                             clip["end_sec"] - clip["start_sec"])
-        ]
+        logo = _resolve_logo(svc, p["user_id"], opts.get("logo"))
         out = work / "clip.mp4"
         work.mkdir(parents=True, exist_ok=True)
-        ff.render_clip(
-            local, out, clip["start_sec"], clip["end_sec"], work_dir=work,
-            orientation=opts.get("orientation", "landscape"),
-            resolution=opts.get("resolution", "1080p"),
-            mirror=bool(opts.get("mirror")), captions=captions, has_audio=has_audio,
-            effects=effects,
-        )
+        if len(parts) > 1:
+            ff.render_mix(
+                local, out, parts, work_dir=work, orientation=orientation, resolution=resolution,
+                mirror=bool(opts.get("mirror")), captions=captions, has_audio=has_audio, logo=logo,
+            )
+        else:
+            from .media import Effect
+
+            effects = [
+                Effect(path=path, kind=e["kind"], at=float(e["at"]), duration=float(e.get("duration", 0)))
+                for e, path in _resolve_effects(svc, pid, loads(clip["effects_json"], []), p["theme"],
+                                                 clip["end_sec"] - clip["start_sec"])
+            ]
+            ff.render_clip(
+                local, out, clip["start_sec"], clip["end_sec"], work_dir=work,
+                orientation=orientation, resolution=resolution,
+                mirror=bool(opts.get("mirror")), captions=captions, has_audio=has_audio,
+                effects=effects, logo=logo,
+            )
         key = f"clips/{pid}/clip_{clip['idx']:02d}.mp4"
         svc.storage.put_file(key, out)
         svc.db.run(
@@ -378,6 +407,19 @@ def handle_render(svc: Services, job: dict) -> None:
     finally:
         shutil.rmtree(work, ignore_errors=True)
         _update_project_progress(svc, pid)
+
+
+def _resolve_logo(svc: Services, user_id: str, saved: Optional[dict]):
+    """The logo for a clip, or None when it is off or the user's logo file is gone."""
+    from .branding import clean_logo, logo_key
+    from .media import Logo
+
+    logo = clean_logo(saved)
+    key = logo_key(user_id)
+    if not logo["enabled"] or not svc.storage.exists(key):
+        return None
+    return Logo(path=svc.storage.local_path(key), opacity=logo["opacity"], size=logo["size"],
+                x=logo["x"], y=logo["y"])
 
 
 def _resolve_effects(svc: Services, project_id: str, placements: list[dict], theme: str, clip_length: float):

@@ -27,15 +27,17 @@ from .config import ROOT, Settings, load_settings
 from .db import dumps, loads, new_id, now_iso, today
 import httpx
 
+from .branding import LOGO_MAX_BYTES, MOMENTS_MAX, check_logo_file, logo_key
 from .llm import PRESETS
-from .media import ORIENTATIONS, RESOLUTIONS
+from .media import ORIENTATIONS, RESOLUTIONS, MediaError
 from .pipeline import handlers as pipeline_handlers
+from .planner import clip_parts
 from .transcription.cloud import TRANSCRIPTION_PRESETS
 from .security import (
     SecurityError, check_extension, check_upload_header, decrypt_secret, encrypt_secret, is_platform_link,
     safe_filename, validate_link,
 )
-from .services import Services, build_llm_provider, start_generation
+from .services import Services, build_llm_provider, queue_info, server_load, start_generation
 from .storage import LocalStorage
 
 log = logging.getLogger("clipper.api")
@@ -50,10 +52,24 @@ USER_SETTING_DEFAULTS = {
     "default_captions_style": "classic",
     "default_orientation": "landscape",
     "default_resolution": "1080p",
+    "default_moments_per_clip": 1,
+    "default_logo_on": False,
+    "default_logo_opacity": 80,
+    "default_logo_size": 15,
+    "default_logo_x": 97,
+    "default_logo_y": 3,
 }
 
 
 # -- request bodies --------------------------------------------------------------
+
+class LogoBody(BaseModel):
+    enabled: bool = False
+    opacity: float = Field(default=80, ge=0, le=100)
+    size: float = Field(default=15, ge=5, le=50)     # percent of the frame width
+    x: float = Field(default=97, ge=0, le=100)       # 0 = left edge, 100 = right edge
+    y: float = Field(default=3, ge=0, le=100)        # 0 = top edge, 100 = bottom edge
+
 
 class GenerateBody(BaseModel):
     theme: str
@@ -64,6 +80,8 @@ class GenerateBody(BaseModel):
     captions_style: str = "classic"
     orientation: str = "landscape"
     resolution: str = "1080p"
+    moments_per_clip: int = Field(default=1, ge=1, le=MOMENTS_MAX)  # 1 = single moments
+    logo: Optional[LogoBody] = None
 
 
 class ClipSettingsBody(BaseModel):
@@ -405,6 +423,57 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
             )
         return get_settings(user, s)
 
+    # -- brand logo ----------------------------------------------------------------
+    @app.get("/api/logo")
+    def get_logo(user: dict = user_dep, s: Services = svc_dep) -> dict:
+        return {"logo": _logo_meta(s, user["id"])}
+
+    @app.get("/api/logo/image")
+    def get_logo_image(user: dict = user_dep, s: Services = svc_dep):
+        if not s.storage.exists(logo_key(user["id"])):
+            raise HTTPException(404, "No logo uploaded yet")
+        # Browsers must check again each time, so a replaced logo is never shown from an old copy.
+        return FileResponse(s.storage.local_path(logo_key(user["id"])), media_type="image/png",
+                            headers={"Cache-Control": "no-cache"})
+
+    @app.post("/api/logo", status_code=201)
+    def upload_logo(file: UploadFile = File(...), user: dict = user_dep, s: Services = svc_dep) -> dict:
+        if s.ffmpeg is None:
+            raise HTTPException(503, "FFmpeg is not available on this server")
+        raw = file.file.read(LOGO_MAX_BYTES + 1)
+        if len(raw) > LOGO_MAX_BYTES:
+            raise HTTPException(413, "The logo must be 5 MB or smaller")
+        try:
+            ext = check_logo_file(file.filename or "", raw[:16])
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        work = settings.work_dir / f"logo-{new_id()}"
+        work.mkdir(parents=True, exist_ok=True)
+        try:
+            src = work / f"upload{ext}"
+            src.write_bytes(raw)
+            png = work / "logo.png"
+            try:
+                s.ffmpeg.image_to_png(src, png)
+            except MediaError:
+                raise HTTPException(400, "That image could not be read. Use a PNG, JPG or WebP file.")
+            s.storage.put_file(logo_key(user["id"]), png)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        meta = dumps({"name": safe_filename(file.filename or "logo")[:120], "uploaded_at": now_iso()})
+        s.db.run(
+            "INSERT INTO settings (user_id, key, value) VALUES (?, 'logo_meta', ?) "
+            "ON CONFLICT (user_id, key) DO UPDATE SET value = excluded.value",
+            (user["id"], meta),
+        )
+        return {"logo": _logo_meta(s, user["id"])}
+
+    @app.delete("/api/logo")
+    def delete_logo(user: dict = user_dep, s: Services = svc_dep) -> dict:
+        s.storage.delete(logo_key(user["id"]))
+        s.db.run("DELETE FROM settings WHERE user_id = ? AND key = 'logo_meta'", (user["id"],))
+        return {"deleted": True}
+
     # -- transcription models ----------------------------------------------------
     @app.get("/api/models")
     def models(s: Services = svc_dep) -> dict:
@@ -704,6 +773,10 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
         )
         s.queue.enqueue(user["id"], project_id, "download")
         return _project_view(s, s.db.one("SELECT * FROM projects WHERE id = ?", (project_id,)))
+
+    @app.get("/api/queue")
+    def queue_status(user: dict = user_dep, s: Services = svc_dep) -> dict:
+        return server_load(s)
 
     @app.get("/api/projects")
     def list_projects(user: dict = user_dep, s: Services = svc_dep) -> dict:
@@ -1076,6 +1149,16 @@ def _validate_setting(key: str, value, svc: Services) -> None:
         raise HTTPException(400, "Unknown orientation")
     if key == "default_resolution" and value not in RESOLUTIONS:
         raise HTTPException(400, "Unknown resolution")
+    if key == "default_moments_per_clip" and (not isinstance(value, int) or not 1 <= value <= MOMENTS_MAX):
+        raise HTTPException(400, f"Moments per clip must be between 1 and {MOMENTS_MAX}")
+    if key == "default_logo_on" and not isinstance(value, bool):
+        raise HTTPException(400, "The logo setting must be on or off")
+    bounds = {"default_logo_opacity": (0, 100), "default_logo_size": (5, 50),
+              "default_logo_x": (0, 100), "default_logo_y": (0, 100)}
+    if key in bounds:
+        lo, hi = bounds[key]
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not lo <= value <= hi:
+            raise HTTPException(400, f"The logo setting must be between {lo} and {hi}")
 
 
 def _check_clip_options(captions: str, orientation: str, resolution: str) -> None:
@@ -1167,14 +1250,26 @@ def _media_link(svc: Services, user_id: str, ref: str, path: str) -> str:
     return f"{path}?t={issue_media_token(svc.settings, user_id, ref)}"
 
 
+def _logo_meta(svc: Services, user_id: str) -> Optional[dict]:
+    """The uploaded logo's name and date, or None when there is no logo."""
+    if not svc.storage.exists(logo_key(user_id)):
+        return None
+    row = svc.db.one("SELECT value FROM settings WHERE user_id = ? AND key = 'logo_meta'", (user_id,))
+    meta = loads(row["value"], {}) if row else {}
+    return {"name": meta.get("name", "logo"), "uploaded_at": meta.get("uploaded_at")}
+
+
 def _clip_rows(svc: Services, project_id: str) -> list[dict]:
     rows = svc.db.all("SELECT * FROM clips WHERE project_id = ? ORDER BY idx", (project_id,))
     owner = svc.db.one("SELECT user_id FROM projects WHERE id = ?", (project_id,))["user_id"]
     out = []
     for r in rows:
+        parts = clip_parts(r["start_sec"], r["end_sec"], r.get("segments_json"))
         out.append({
             "id": r["id"], "idx": r["idx"], "start": r["start_sec"], "end": r["end_sec"],
-            "length": round(r["end_sec"] - r["start_sec"], 2),
+            "length": round(sum(b - a for a, b in parts), 2),
+            "moments": len(parts),
+            "segments": [[round(a, 2), round(b, 2)] for a, b in parts],
             "score": r["score"], "reason": r["reason"], "status": r["status"], "error": r["error"],
             "provider_used": r["provider_used"], "settings": loads(r["settings_json"], {}),
             "effects": loads(r["effects_json"], []), "views": r["views"], "likes": r["likes"],
@@ -1205,6 +1300,8 @@ def _project_view(svc: Services, row: dict, with_clips: bool = True) -> dict:
         "captions_style": row["captions_style"],
         "orientation": row["orientation"],
         "resolution": row["resolution"],
+        "moments_per_clip": row.get("moments_per_clip") or 1,
+        "logo": loads(row.get("logo_json"), None),
         "transcription_engine": row["transcription_engine"],
         "provider_used": row["provider_used"],
         "error": row["error"],
@@ -1212,6 +1309,8 @@ def _project_view(svc: Services, row: dict, with_clips: bool = True) -> dict:
         "updated_at": row["updated_at"],
         "has_transcript": svc.db.one("SELECT 1 AS x FROM transcripts WHERE project_id = ?", (row["id"],)) is not None,
         "zip_url": _media_link(svc, row["user_id"], f"project:{row['id']}", f"/api/projects/{row['id']}/zip"),
+        # Where this project waits in line, when its next step is queued behind other work.
+        "queue": queue_info(svc, row["id"]) if row["status"] in ACTIVE_STATES else None,
     }
     if with_clips:
         view["clips"] = _clip_rows(svc, row["id"])

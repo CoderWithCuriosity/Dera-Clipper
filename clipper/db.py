@@ -239,7 +239,12 @@ class Database:
 
     def _migrate(self) -> None:
         """Add columns introduced after a database was first created."""
-        additions = [("projects", "effects_enabled", "INTEGER NOT NULL DEFAULT 1")]
+        additions = [
+            ("projects", "effects_enabled", "INTEGER NOT NULL DEFAULT 1"),
+            ("projects", "moments_per_clip", "INTEGER NOT NULL DEFAULT 1"),  # 1 = single moments
+            ("projects", "logo_json", "TEXT"),                              # logo options used for this project
+            ("clips", "segments_json", "TEXT"),                             # joined moments [[start, end], ...]
+        ]
         with self._conn() as conn:
             for table, column, decl in additions:
                 if self.kind == "sqlite":

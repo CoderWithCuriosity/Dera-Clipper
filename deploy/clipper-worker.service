@@ -1,0 +1,25 @@
+# Job worker: transcribes and renders, in its own process, so the website stays responsive.
+# Copy to /etc/systemd/system/clipper-worker.service, then:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now clipper-worker
+# The web service must run with CLIPPER_RUN_WORKER=false (see deploy/vps.env.example).
+[Unit]
+Description=AI Clipper job worker
+After=network-online.target clipper.service
+Wants=network-online.target
+
+[Service]
+User=clipper
+WorkingDirectory=/opt/clipper
+EnvironmentFile=/etc/clipper/clipper.env
+ExecStart=/opt/clipper/.venv/bin/python -m clipper worker
+Restart=on-failure
+RestartSec=10
+# Lower priority than the website, and leave one of the two cores free for it.
+Nice=10
+CPUQuota=170%
+# If a job ever needs more memory than this, only the worker is stopped, not the machine.
+MemoryMax=2800M
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

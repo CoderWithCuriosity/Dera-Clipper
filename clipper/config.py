@@ -67,7 +67,9 @@ class Settings:
     upload_max_mb: int
     max_duration_sec: int
     upload_retention_days: int
-    worker_concurrency: int
+    worker_concurrency: int      # threads in the worker; at least heavy_jobs_max + light_jobs_max
+    heavy_jobs_max: int          # transcribing and rendering at once (CPU and memory heavy)
+    light_jobs_max: int          # planning and downloads at once (mostly waiting on the network)
     run_worker: bool
     require_auth: bool
     host: str
@@ -132,6 +134,10 @@ def load_settings() -> Settings:
         "aws": dict(storage="s3", auth=True, engine="cloud", concurrency=2, whisper="base"),
     }[mode]
 
+    cpus = os.cpu_count() or 2
+    heavy_jobs = _int("HEAVY_JOBS", 1 if cpus <= 2 else max(1, cpus // 2))
+    light_jobs = _int("LIGHT_JOBS", 3)
+
     storage = (_get("STORAGE", defaults["storage"]) or "local").lower()
     if storage not in ("local", "s3"):
         raise ValueError("CLIPPER_STORAGE must be 'local' or 's3'")
@@ -154,7 +160,9 @@ def load_settings() -> Settings:
         upload_max_mb=_int("UPLOAD_MAX_MB", 2048),
         max_duration_sec=_int("MAX_DURATION_SEC", 4 * 3600),
         upload_retention_days=_int("UPLOAD_RETENTION_DAYS", 7),
-        worker_concurrency=_int("WORKER_CONCURRENCY", defaults["concurrency"]),
+        worker_concurrency=_int("WORKER_CONCURRENCY", heavy_jobs + light_jobs),
+        heavy_jobs_max=heavy_jobs,
+        light_jobs_max=light_jobs,
         run_worker=_bool("RUN_WORKER", True),
         require_auth=_bool("REQUIRE_AUTH", defaults["auth"]),
         host=_get("HOST", "127.0.0.1" if mode == "local" else "0.0.0.0"),

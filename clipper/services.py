@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
+from .branding import MOMENTS_MAX, MOMENTS_MIN_SECONDS, clean_logo, logo_key
 from .config import Settings
 from .db import Database, dumps, iso_in, loads, new_id, now_iso
 from .llm import PRESETS, LLMProvider
@@ -18,6 +19,57 @@ from .storage import Storage, build_storage
 log = logging.getLogger("clipper")
 
 JOB_TYPES = ("download", "transcribe", "plan", "render")
+HEAVY_TYPES = ("transcribe", "render")
+MIN_FREE_MEMORY_MB = 900  # a heavy job needs about this much; below it, the job waits
+
+
+def memory_has_room() -> bool:
+    """False when the server is short of memory. Linux only; elsewhere it always allows work."""
+    try:
+        with open("/proc/meminfo", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024 >= MIN_FREE_MEMORY_MB
+    except (OSError, ValueError):
+        pass
+    return True
+
+
+def queue_info(svc: "Services", project_id: str) -> Optional[dict]:
+    """Where a waiting project stands in line. None when its work is not waiting."""
+    job = svc.db.one(
+        "SELECT * FROM jobs WHERE project_id = ? AND status = 'queued' ORDER BY created_at LIMIT 1",
+        (project_id,),
+    )
+    if job is None:
+        return None
+    ahead = svc.db.one(
+        "SELECT COUNT(*) AS n FROM jobs WHERE status = 'queued' AND created_at < ?", (job["created_at"],),
+    )["n"]
+    heavy_busy = svc.db.one(
+        "SELECT COUNT(*) AS n FROM jobs WHERE status = 'running' AND type IN ('transcribe', 'render')",
+    )["n"]
+    heavy = job["type"] in HEAVY_TYPES
+    if heavy and heavy_busy >= svc.settings.heavy_jobs_max:
+        reason = (f"The server works on {svc.settings.heavy_jobs_max} video at a time for heavy steps "
+                  "(transcribing and rendering), so it stays responsive.")
+    elif heavy and not memory_has_room():
+        reason = "The server is short of memory right now. This starts as soon as memory frees up."
+    else:
+        reason = "Starting soon."
+    return {"position": ahead + 1, "ahead": ahead, "heavy": heavy, "reason": reason}
+
+
+def server_load(svc: "Services") -> dict:
+    """What the queue is doing right now, for the banner on the projects page."""
+    counts = {r["type"] + ":" + r["status"]: r["n"] for r in svc.db.all(
+        "SELECT type, status, COUNT(*) AS n FROM jobs WHERE status IN ('running', 'queued') GROUP BY type, status")}
+    heavy_running = sum(counts.get(f"{t}:running", 0) for t in HEAVY_TYPES)
+    waiting = sum(v for k, v in counts.items() if k.endswith(":queued"))
+    return {
+        "heavy_running": heavy_running, "heavy_limit": svc.settings.heavy_jobs_max,
+        "waiting": waiting, "memory_ok": memory_has_room(),
+    }
 
 
 @dataclass
@@ -130,11 +182,26 @@ def start_generation(svc: "Services", project: dict, opts: dict) -> None:
     resolution = opts.get("resolution", "1080p")
     if resolution not in RESOLUTIONS:
         raise ValueError("Unknown resolution")
+    try:
+        per_clip = int(opts.get("moments_per_clip") or 1)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Moments per clip must be a whole number") from exc
+    if not 1 <= per_clip <= MOMENTS_MAX:
+        raise ValueError(f"Moments per clip must be between 1 and {MOMENTS_MAX}")
+    if per_clip > 1 and clip_length / per_clip < MOMENTS_MIN_SECONDS:
+        raise ValueError(
+            f"With {per_clip} moments per clip, the clip length must be at least "
+            f"{MOMENTS_MIN_SECONDS * per_clip:.0f} seconds, so each moment is long enough to follow"
+        )
+    logo = clean_logo(opts.get("logo"))
+    if logo["enabled"] and not svc.storage.exists(logo_key(project["user_id"])):
+        raise ValueError("Upload your logo in Setup before adding it to clips")
     svc.set_project(
         project["id"], theme=theme, clip_length=clip_length, clip_count=clip_count,
         mirror=1 if opts.get("mirror") else 0, captions_style=captions, orientation=orientation,
         effects_enabled=1 if opts.get("effects", True) else 0,
-        resolution=resolution, error=None, status="planning", status_message="Queued for planning", progress=0.0,
+        resolution=resolution, moments_per_clip=per_clip, logo_json=dumps(logo),
+        error=None, status="planning", status_message="Queued for planning", progress=0.0,
     )
     svc.queue.enqueue(project["user_id"], project["id"], "plan")
 
@@ -196,27 +263,44 @@ class JobQueue:
         return job_id
 
     def claim(self) -> Optional[dict]:
-        """Take the oldest queued job whose owner is still under their concurrency limit, so one
-        heavy user cannot hold every worker."""
+        """Take the oldest queued job that may run now. Heavy jobs (transcribing and rendering)
+        share a few slots, so the server's CPU and memory are never swamped. Light jobs have
+        their own slots and keep moving while heavy ones wait. Each user is also capped, so one
+        person cannot take every slot."""
         db = self.svc.db
-        candidate = db.one(
-            "SELECT j.id FROM jobs j WHERE j.status = 'queued' AND j.run_after <= ? AND "
-            "(SELECT COUNT(*) FROM jobs r WHERE r.user_id = j.user_id AND r.status = 'running') < ? "
-            "ORDER BY j.created_at LIMIT 1",
-            (now_iso(), self.svc.settings.max_running_jobs_per_user),
+        settings = self.svc.settings
+        running = db.all("SELECT type, user_id FROM jobs WHERE status = 'running'")
+        heavy_running = sum(1 for r in running if r["type"] in HEAVY_TYPES)
+        light_running = len(running) - heavy_running
+        per_user: dict[str, int] = {}
+        for r in running:
+            per_user[r["user_id"]] = per_user.get(r["user_id"], 0) + 1
+        heavy_free = heavy_running < settings.heavy_jobs_max and memory_has_room()
+        light_free = light_running < settings.light_jobs_max
+
+        candidates = db.all(
+            "SELECT id, user_id, type FROM jobs WHERE status = 'queued' AND run_after <= ? "
+            "ORDER BY created_at LIMIT 100",
+            (now_iso(),),
         )
-        if not candidate:
-            return None
-        claimed = db.run(
-            "UPDATE jobs SET status = 'running', attempts = attempts + 1, updated_at = ? "
-            "WHERE id = ? AND status = 'queued'",
-            (now_iso(), candidate["id"]),
-        )
-        if claimed != 1:
-            return None
-        job = db.one("SELECT * FROM jobs WHERE id = ?", (candidate["id"],))
-        job["payload"] = loads(job.get("payload_json"), {})
-        return job
+        for cand in candidates:
+            if per_user.get(cand["user_id"], 0) >= settings.max_running_jobs_per_user:
+                continue
+            if cand["type"] in HEAVY_TYPES and not heavy_free:
+                continue
+            if cand["type"] not in HEAVY_TYPES and not light_free:
+                continue
+            claimed = db.run(
+                "UPDATE jobs SET status = 'running', attempts = attempts + 1, updated_at = ? "
+                "WHERE id = ? AND status = 'queued'",
+                (now_iso(), cand["id"]),
+            )
+            if claimed != 1:
+                continue  # another thread took it first
+            job = db.one("SELECT * FROM jobs WHERE id = ?", (cand["id"],))
+            job["payload"] = loads(job.get("payload_json"), {})
+            return job
+        return None
 
     def finish(self, job_id: str, error: Optional[str] = None) -> None:
         self.svc.db.run(

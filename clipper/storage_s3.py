@@ -47,6 +47,10 @@ class S3Storage:
         # Store the real content type. Without it, browsers refuse to play the video.
         content_type = mimetypes.guess_type(str(src))[0] or "application/octet-stream"
         self.client.upload_file(str(src), self.bucket, self._key(key), ExtraArgs={"ContentType": content_type})
+        # Drop any cached copy, so the next read downloads the new file instead of the old one.
+        stale = self.cache.joinpath(*key.split("/"))
+        if stale.is_file():
+            stale.unlink()
 
     def exists(self, key: str) -> bool:
         from botocore.exceptions import ClientError
