@@ -98,6 +98,46 @@ class Services:
         return engines
 
 
+CLIP_STATES_ACTIVE = ("queued", "acquiring", "preparing_audio", "transcribing", "planning", "rendering")
+
+
+def start_generation(svc: "Services", project: dict, opts: dict) -> None:
+    """Store the clip settings on a project and queue planning. Raises ValueError with a
+    message the user can act on. Used by the Generate button and by batches."""
+    from . import effects
+    from .media import ORIENTATIONS, RESOLUTIONS, caption_styles
+
+    theme = opts.get("theme")
+    if theme not in effects.list_themes(svc):
+        raise ValueError("Unknown theme")
+    try:
+        clip_length = float(opts["clip_length"])
+        clip_count = int(opts["clip_count"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Clip length and clip count are required") from exc
+    if clip_length <= 0:
+        raise ValueError("Clip length must be greater than zero")
+    if project.get("duration") is None or clip_length > project["duration"]:
+        raise ValueError(f"Clip length cannot exceed the video length ({(project.get('duration') or 0):.0f} s)")
+    if not 1 <= clip_count <= 20:
+        raise ValueError("Clip count must be between 1 and 20")
+    captions = opts.get("captions_style", "classic")
+    if captions not in set(caption_styles()) | {"off"}:
+        raise ValueError("Unknown caption style")
+    orientation = opts.get("orientation", "landscape")
+    if orientation not in ORIENTATIONS:
+        raise ValueError("Unknown orientation")
+    resolution = opts.get("resolution", "1080p")
+    if resolution not in RESOLUTIONS:
+        raise ValueError("Unknown resolution")
+    svc.set_project(
+        project["id"], theme=theme, clip_length=clip_length, clip_count=clip_count,
+        mirror=1 if opts.get("mirror") else 0, captions_style=captions, orientation=orientation,
+        resolution=resolution, error=None, status="planning", status_message="Queued for planning", progress=0.0,
+    )
+    svc.queue.enqueue(project["user_id"], project["id"], "plan")
+
+
 def build_llm_provider(settings: Settings, row: dict) -> LLMProvider:
     preset = PRESETS.get(row["preset"])
     if preset is None:

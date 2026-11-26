@@ -33,12 +33,12 @@ from .security import (
     SecurityError, check_extension, check_upload_header, decrypt_secret, encrypt_secret, safe_filename,
     validate_link,
 )
-from .services import Services, build_llm_provider
+from .services import Services, build_llm_provider, start_generation
 from .storage import LocalStorage
 
 log = logging.getLogger("clipper.api")
 
-CAPTION_STYLES = ["classic", "bold", "boxed", "off"]
+CAPTION_STYLES = ["classic", "bold", "boxed", "karaoke", "off"]
 ACTIVE_STATES = ("queued", "acquiring", "preparing_audio", "transcribing", "planning", "rendering")
 USER_SETTING_DEFAULTS = {
     "default_theme": "Funny",
@@ -102,6 +102,15 @@ class AuthBody(BaseModel):
 class PasswordBody(BaseModel):
     current_password: str
     new_password: str
+
+
+class MetricsBody(BaseModel):
+    views: int = Field(ge=0, le=10**12)
+    likes: int = Field(default=0, ge=0, le=10**12)
+
+
+class BatchIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
 
 
 class AdminUserPatch(BaseModel):
@@ -499,9 +508,12 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
         file: Optional[UploadFile] = File(None),
         url: Optional[str] = Form(None),
         title: Optional[str] = Form(None),
+        batch_id: Optional[str] = Form(None),
         user: dict = user_dep,
         s: Services = svc_dep,
     ) -> dict:
+        if batch_id:
+            _owned(s, "batches", batch_id, user)
         today_count = s.db.one(
             "SELECT COUNT(*) AS n FROM projects WHERE user_id = ? AND created_at >= ?",
             (user["id"], today()),
@@ -558,11 +570,11 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
         mode_row = s.db.one("SELECT value FROM settings WHERE user_id = ? AND key = 'transcription_mode'", (user["id"],))
         transcription_mode = loads(mode_row["value"]) if mode_row else settings.default_transcription_engine
         s.db.run(
-            "INSERT INTO projects (id, user_id, title, source_type, source_location, source_key, file_size, mode, "
-            "status, progress, status_message, transcription_mode, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, 'Waiting to start', ?, ?, ?)",
-            (project_id, user["id"], display, source_type, location, source_key, file_size, settings.mode,
-             transcription_mode, now, now),
+            "INSERT INTO projects (id, user_id, batch_id, title, source_type, source_location, source_key, file_size, "
+            "mode, status, progress, status_message, transcription_mode, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, 'Waiting to start', ?, ?, ?)",
+            (project_id, user["id"], batch_id or None, display, source_type, location, source_key, file_size,
+             settings.mode, transcription_mode, now, now),
         )
         s.queue.enqueue(user["id"], project_id, "download")
         return _project_view(s, s.db.one("SELECT * FROM projects WHERE id = ?", (project_id,)))
@@ -608,18 +620,10 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
             raise HTTPException(409, "This project is still working. Try again when it finishes.")
         if row["duration"] is None or s.db.one("SELECT 1 AS x FROM transcripts WHERE project_id = ?", (project_id,)) is None:
             raise HTTPException(409, "The transcript is not ready yet")
-        if body.clip_length > row["duration"]:
-            raise HTTPException(400, f"Clip length cannot exceed the video length ({row['duration']:.0f} s)")
-        if body.theme not in effects.list_themes(s):
-            raise HTTPException(400, "Unknown theme")
-        _check_clip_options(body.captions_style, body.orientation, body.resolution)
-        s.set_project(
-            project_id, theme=body.theme, clip_length=body.clip_length, clip_count=body.clip_count,
-            mirror=1 if body.mirror else 0, captions_style=body.captions_style,
-            orientation=body.orientation, resolution=body.resolution, error=None,
-            status="planning", status_message="Queued for planning", progress=0.0,
-        )
-        s.queue.enqueue(user["id"], project_id, "plan")
+        try:
+            start_generation(s, row, body.model_dump())
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
         return _project_view(s, s.db.one("SELECT * FROM projects WHERE id = ?", (project_id,)))
 
     @app.post("/api/projects/{project_id}/retry", status_code=202)
@@ -700,6 +704,68 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
         return FileResponse(archive, media_type="application/zip",
                             filename=f"{safe_filename(project['title'])}-clips.zip")
 
+    # -- performance and analytics -------------------------------------------------
+    @app.post("/api/clips/{clip_id}/metrics")
+    def clip_metrics(clip_id: str, body: MetricsBody, user: dict = user_dep, s: Services = svc_dep) -> dict:
+        _clip_owned(s, clip_id, user)
+        s.db.run("UPDATE clips SET views = ?, likes = ?, updated_at = ? WHERE id = ?",
+                 (body.views, body.likes, now_iso(), clip_id))
+        return {"saved": True}
+
+    @app.get("/api/analytics")
+    def analytics(user: dict = user_dep, s: Services = svc_dep) -> dict:
+        return _analytics(s, user["id"])
+
+    # -- batches -----------------------------------------------------------------------
+    @app.post("/api/batches", status_code=201)
+    def create_batch(body: BatchIn, user: dict = user_dep, s: Services = svc_dep) -> dict:
+        name = body.name.strip()
+        if not name:
+            raise HTTPException(400, "Give the batch a name")
+        batch_id = new_id()
+        s.db.run("INSERT INTO batches (id, user_id, name, settings_json, created_at) VALUES (?, ?, ?, NULL, ?)",
+                 (batch_id, user["id"], name[:120], now_iso()))
+        return _batch_view(s, _owned(s, "batches", batch_id, user))
+
+    @app.get("/api/batches")
+    def list_batches(user: dict = user_dep, s: Services = svc_dep) -> dict:
+        rows = s.db.all("SELECT * FROM batches WHERE user_id = ? ORDER BY created_at DESC", (user["id"],))
+        return {"batches": [_batch_view(s, r) for r in rows]}
+
+    @app.get("/api/batches/{batch_id}")
+    def get_batch(batch_id: str, user: dict = user_dep, s: Services = svc_dep) -> dict:
+        return _batch_view(s, _owned(s, "batches", batch_id, user), with_projects=True)
+
+    @app.put("/api/batches/{batch_id}/settings")
+    def batch_settings(batch_id: str, body: GenerateBody, user: dict = user_dep, s: Services = svc_dep) -> dict:
+        """Save the clip settings for the batch, then start generating every project that is
+        ready. Projects still transcribing start automatically when their transcript is done."""
+        batch = _owned(s, "batches", batch_id, user)
+        opts = body.model_dump()
+        applied, waiting, errors = 0, 0, []
+        projects = s.db.all("SELECT * FROM projects WHERE batch_id = ? AND user_id = ?", (batch_id, user["id"]))
+        for p in projects:
+            ready = s.db.one("SELECT 1 AS x FROM transcripts WHERE project_id = ?", (p["id"],)) is not None
+            if p["status"] in ACTIVE_STATES or not ready:
+                waiting += 1
+                continue
+            try:
+                start_generation(s, p, opts)
+                applied += 1
+            except ValueError as exc:
+                errors.append(f"{p['title']}: {exc}")
+        s.db.run("UPDATE batches SET settings_json = ? WHERE id = ?", (dumps(opts), batch["id"]))
+        return {"applied": applied, "waiting": waiting, "errors": errors}
+
+    @app.delete("/api/batches/{batch_id}")
+    def delete_batch(batch_id: str, user: dict = user_dep, s: Services = svc_dep) -> dict:
+        _owned(s, "batches", batch_id, user)
+        s.db.run_many([
+            ("UPDATE projects SET batch_id = NULL WHERE batch_id = ?", (batch_id,)),
+            ("DELETE FROM batches WHERE id = ?", (batch_id,)),
+        ])
+        return {"deleted": True}
+
     # -- interface ---------------------------------------------------------------
     web_dir = ROOT / "web"
     if web_dir.exists():
@@ -730,6 +796,78 @@ def _start_session(s: Services, user_id: str, email: str, role: str, response: R
     )
     access = issue_access_token(s.settings, {"id": user_id, "role": role})
     return {"access_token": access, "expires_in": 900, "user": {"id": user_id, "email": email, "role": role}}
+
+
+def _batch_view(svc: Services, row: dict, with_projects: bool = False) -> dict:
+    counts = {r["status"]: r["n"] for r in svc.db.all(
+        "SELECT status, COUNT(*) AS n FROM projects WHERE batch_id = ? GROUP BY status", (row["id"],))}
+    view = {"id": row["id"], "name": row["name"], "created_at": row["created_at"],
+            "settings": loads(row.get("settings_json"), None), "projects": sum(counts.values()),
+            "status_counts": counts}
+    if with_projects:
+        rows = svc.db.all("SELECT * FROM projects WHERE batch_id = ? ORDER BY created_at", (row["id"],))
+        view["items"] = [_project_view(svc, r, with_clips=False) for r in rows]
+    return view
+
+
+def _score_band(score) -> str:
+    value = score or 0.0
+    if value < 0.5:
+        return "below 0.5"
+    if value < 0.7:
+        return "0.5-0.7"
+    if value < 0.85:
+        return "0.7-0.85"
+    return "0.85 and up"
+
+
+def _length_band(seconds: float) -> str:
+    if seconds <= 30:
+        return "30 s or less"
+    if seconds <= 45:
+        return "31-45 s"
+    if seconds <= 60:
+        return "46-60 s"
+    return "over 60 s"
+
+
+def _analytics(svc: Services, user_id: str) -> dict:
+    rows = svc.db.all(
+        "SELECT c.id, c.score, c.reason, c.views, c.likes, c.start_sec, c.end_sec, c.effects_json, "
+        "p.title, p.theme FROM clips c JOIN projects p ON p.id = c.project_id "
+        "WHERE p.user_id = ? AND c.status = 'done'", (user_id,))
+    measured = [r for r in rows if r["views"] is not None]
+
+    def summarise(items: list) -> dict:
+        if not items:
+            return {"clips": 0, "avg_views": None, "avg_likes": None}
+        return {
+            "clips": len(items),
+            "avg_views": round(sum(r["views"] for r in items) / len(items), 1),
+            "avg_likes": round(sum((r["likes"] or 0) for r in items) / len(items), 1),
+        }
+
+    def group(key_fn, labels: list) -> dict:
+        buckets = {label: [] for label in labels}
+        for r in measured:
+            buckets.setdefault(key_fn(r), []).append(r)
+        return {label: summarise(items) for label, items in buckets.items()}
+
+    has_effects = lambda r: bool(loads(r["effects_json"], []))  # noqa: E731
+    top = sorted(measured, key=lambda r: r["views"], reverse=True)[:5]
+    return {
+        "clips_total": len(rows),
+        "clips_with_metrics": len(measured),
+        "overall": summarise(measured),
+        "by_score": group(lambda r: _score_band(r["score"]), ["below 0.5", "0.5-0.7", "0.7-0.85", "0.85 and up"]),
+        "by_length": group(lambda r: _length_band((r["end_sec"] or 0) - (r["start_sec"] or 0)),
+                           ["30 s or less", "31-45 s", "46-60 s", "over 60 s"]),
+        "by_theme": group(lambda r: r["theme"] or "unknown", sorted({r["theme"] or "unknown" for r in measured})),
+        "with_effects": summarise([r for r in measured if has_effects(r)]),
+        "without_effects": summarise([r for r in measured if not has_effects(r)]),
+        "top_clips": [{"id": r["id"], "title": r["title"], "reason": r["reason"], "score": r["score"],
+                       "views": r["views"], "likes": r["likes"]} for r in top],
+    }
 
 
 def _admin_count(s: Services) -> int:
@@ -867,6 +1005,7 @@ def _project_view(svc: Services, row: dict, with_clips: bool = True) -> dict:
     view = {
         "id": row["id"],
         "title": row["title"],
+        "batch_id": row.get("batch_id"),
         "source_type": row["source_type"],
         "source_location": row["source_location"],
         "duration": row["duration"],

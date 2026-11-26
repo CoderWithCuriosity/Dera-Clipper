@@ -222,6 +222,44 @@ def _ass_text(text: str) -> str:
     return text.replace("\\", "/").replace("{", "(").replace("}", ")").replace("\n", " ").strip()
 
 
+def _caption_lines(segments, words, clip_start: float, clip_end: float, karaoke: bool) -> list[tuple[float, float, str]]:
+    """Caption lines for one clip. Text is escaped here, once, so karaoke tags survive."""
+    lines: list[tuple[float, float, str]] = []
+    if words:
+        bucket: list[dict] = []
+
+        def flush() -> None:
+            if not bucket:
+                return
+            if karaoke:
+                # {\kN}: N centiseconds for each word, so the highlight moves with the speech.
+                parts = []
+                for x in bucket:
+                    cs = max(1, round((x["end"] - x["start"]) * 100))
+                    parts.append("{\\k%d}%s" % (cs, _ass_text(x["word"].strip())))
+                text = " ".join(parts)
+            else:
+                text = " ".join(_ass_text(x["word"].strip()) for x in bucket)
+            lines.append((bucket[0]["start"], bucket[-1]["end"], text))
+            bucket.clear()
+
+        for w in words:
+            if w["end"] <= clip_start or w["start"] >= clip_end:
+                continue
+            bucket.append(w)
+            if len(bucket) >= 5 or bucket[-1]["end"] - bucket[0]["start"] >= 2.4:
+                flush()
+        flush()
+    else:
+        for seg in segments:
+            if seg["end"] <= clip_start or seg["start"] >= clip_end:
+                continue
+            text = seg["text"].strip()
+            if text:
+                lines.append((max(seg["start"], clip_start), min(seg["end"], clip_end), _ass_text(text)))
+    return lines
+
+
 def build_captions_ass(
     segments: Sequence[dict],
     words: Optional[Sequence[dict]],
@@ -232,28 +270,12 @@ def build_captions_ass(
     style: str = "classic",
 ) -> Optional[str]:
     """Build an ASS subtitle file for one clip. Word timings are used when present,
-    grouped into short caption lines; otherwise segment text is used."""
-    lines: list[tuple[float, float, str]] = []
-    if words:
-        bucket: list[dict] = []
-        for w in words:
-            if w["end"] <= clip_start or w["start"] >= clip_end:
-                continue
-            bucket.append(w)
-            span = bucket[-1]["end"] - bucket[0]["start"]
-            if len(bucket) >= 5 or span >= 2.4:
-                lines.append((bucket[0]["start"], bucket[-1]["end"], " ".join(x["word"].strip() for x in bucket)))
-                bucket = []
-        if bucket:
-            lines.append((bucket[0]["start"], bucket[-1]["end"], " ".join(x["word"].strip() for x in bucket)))
-    else:
-        for seg in segments:
-            if seg["end"] <= clip_start or seg["start"] >= clip_end:
-                continue
-            text = seg["text"].strip()
-            if text:
-                lines.append((max(seg["start"], clip_start), min(seg["end"], clip_end), text))
-
+    grouped into short caption lines; otherwise segment text is used. The karaoke style
+    highlights each word as it is spoken, and needs word timings."""
+    if style not in _CAPTION_STYLES:
+        style = "classic"
+    karaoke = style == "karaoke" and bool(words)
+    lines = _caption_lines(segments, words, clip_start, clip_end, karaoke)
     if not lines:
         return None
 
@@ -279,13 +301,15 @@ def build_captions_ass(
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
     events = [
-        f"Dialogue: 0,{_ass_time(a - clip_start)},{_ass_time(b - clip_start)},Default,,0,0,0,,{_ass_text(t)}"
+        f"Dialogue: 0,{_ass_time(a - clip_start)},{_ass_time(b - clip_start)},Default,,0,0,0,,{t}"
         for a, b, t in lines
     ]
     return "\n".join(header + events) + "\n"
 
 
 # Caption styles. Each one is a single ASS style line, so new looks can be added here.
+# Colours are ASS &HAABBGGRR values. For karaoke, PrimaryColour is the highlight and
+# SecondaryColour is the colour of words not yet spoken.
 _CAPTION_STYLES = {
     # white text, black outline
     "classic": "&H00FFFFFF,&H000000FF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,4,1,2",
@@ -293,6 +317,8 @@ _CAPTION_STYLES = {
     "bold": "&H0000FFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,6,2,2",
     # white text on a translucent black box
     "boxed": "&H00FFFFFF,&H000000FF,&H00000000,&HA0000000,-1,0,0,0,100,100,0,0,3,0,0,2",
+    # each word turns yellow as it is spoken; unspoken words are white
+    "karaoke": "&H0000FFFF,&H00FFFFFF,&H00000000,&H64000000,-1,0,0,0,100,100,0,0,1,5,1,2",
 }
 
 

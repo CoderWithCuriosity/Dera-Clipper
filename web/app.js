@@ -185,7 +185,7 @@
               </select></div>
             <div><label for="captions_style">Captions</label>
               <select id="captions_style">
-                ${["classic|Classic (white, outlined)", "bold|Bold (yellow, thick outline)", "boxed|Boxed (on a dark box)", "off|No captions"]
+                ${["classic|Classic (white, outlined)", "bold|Bold (yellow, thick outline)", "boxed|Boxed (on a dark box)", "karaoke|Karaoke (word highlight)", "off|No captions"]
                   .map((o) => { const [val, lab] = o.split("|"); return `<option value="${val}" ${val === current.captions_style ? "selected" : ""}>${esc(lab)}</option>`; }).join("")}
               </select></div>
           </div>
@@ -209,9 +209,19 @@
             <div>${esc(c.reason || "")}</div>
             ${(c.effects || []).length ? `<div class="small muted">Effects: ${c.effects.map((e) => esc(e.effect_id) + " at " + Math.round(e.at) + " s").join(", ")}</div>` : ""}
             ${c.error ? `<div class="error small">${esc(c.error)}</div>` : ""}
+            ${c.status === "done" ? `
+            <div class="row small">
+              <label style="margin:0">Views <input data-views="${esc(c.id)}" type="number" min="0" value="${esc(c.views == null ? "" : c.views)}" style="width:120px"></label>
+              <label style="margin:0">Likes <input data-likes="${esc(c.id)}" type="number" min="0" value="${esc(c.likes == null ? "" : c.likes)}" style="width:100px"></label>
+              <button class="secondary" data-save-metrics="${esc(c.id)}">Save results</button>
+            </div>` : ""}
             <div class="row">
               ${c.download_url ? `<a class="button" href="${esc(c.download_url)}">Download</a>` : ""}
-              ${c.status !== "pending" && c.status !== "rendering" ? `<button class="secondary" data-regen="${esc(c.id)}">Regenerate this clip</button>` : ""}
+              ${c.status !== "pending" && c.status !== "rendering" ? `
+                <select data-r-caps="${esc(c.id)}" aria-label="Captions">${optionList(CAPTION_OPTIONS, (c.settings || {}).captions_style)}</select>
+                <select data-r-orient="${esc(c.id)}" aria-label="Orientation">${optionList(ORIENTATION_OPTIONS, (c.settings || {}).orientation)}</select>
+                <label class="check"><input type="checkbox" data-r-mirror="${esc(c.id)}" ${(c.settings || {}).mirror ? "checked" : ""}> Mirror</label>
+                <button class="secondary" data-regen="${esc(c.id)}">Regenerate this clip</button>` : ""}
             </div>
           </div>
         </div>`).join("");
@@ -264,8 +274,24 @@
         catch (err) { toast(err.message); }
       });
       app.querySelectorAll("[data-regen]").forEach((btn) => btn.addEventListener("click", async () => {
-        try { await api(`/clips/${encodeURIComponent(btn.dataset.regen)}/regenerate`, { method: "POST", json: {} }); toast("Clip queued"); render(); }
+        const cid = btn.dataset.regen;
+        const body = {
+          captions_style: document.querySelector(`[data-r-caps="${cid}"]`).value,
+          orientation: document.querySelector(`[data-r-orient="${cid}"]`).value,
+          mirror: document.querySelector(`[data-r-mirror="${cid}"]`).checked,
+        };
+        try { await api(`/clips/${encodeURIComponent(cid)}/regenerate`, { method: "POST", json: body }); toast("Clip queued"); render(); }
         catch (err) { toast(err.message); }
+      }));
+      app.querySelectorAll("[data-save-metrics]").forEach((btn) => btn.addEventListener("click", async () => {
+        const cid = btn.dataset.saveMetrics;
+        const views = document.querySelector(`[data-views="${cid}"]`).value;
+        const likes = document.querySelector(`[data-likes="${cid}"]`).value;
+        if (views === "") { toast("Enter the number of views"); return; }
+        try {
+          await api(`/clips/${encodeURIComponent(cid)}/metrics`, { method: "POST", json: { views: Number(views), likes: Number(likes || 0) } });
+          toast("Results saved");
+        } catch (err) { toast(err.message); }
       }));
 
       if (active) { if (!pollTimer) pollTimer = setInterval(render, 2500); }
@@ -339,7 +365,7 @@
           <div><label for="d_res">Resolution</label>
             <select id="d_res">${["1080p", "720p"].map((o) => `<option ${o === v.default_resolution ? "selected" : ""}>${o}</option>`).join("")}</select></div>
           <div><label for="d_caps">Captions</label>
-            <select id="d_caps">${["classic", "bold", "boxed", "off"].map((o) => `<option ${o === v.default_captions_style ? "selected" : ""}>${o}</option>`).join("")}</select></div>
+            <select id="d_caps">${["classic", "bold", "boxed", "karaoke", "off"].map((o) => `<option ${o === v.default_captions_style ? "selected" : ""}>${o}</option>`).join("")}</select></div>
           <div><label for="d_tmode">Transcription</label>
             <select id="d_tmode">
               <option value="local" ${v.transcription_mode === "local" ? "selected" : ""}>Local Whisper (on this machine)</option>
@@ -649,6 +675,177 @@
     });
   }
 
+  // -- batches -------------------------------------------------------------------
+  const CAPTION_OPTIONS = [
+    ["classic", "Classic (white, outlined)"], ["bold", "Bold (yellow, thick outline)"],
+    ["boxed", "Boxed (on a dark box)"], ["karaoke", "Karaoke (word highlight)"], ["off", "No captions"],
+  ];
+  const ORIENTATION_OPTIONS = [
+    ["landscape", "Landscape 16:9 (YouTube)"], ["vertical", "Vertical 9:16 (Shorts, Reels, TikTok)"], ["square", "Square 1:1"],
+  ];
+
+  function optionList(options, selected) {
+    return options.map(([val, label]) => `<option value="${esc(val)}" ${val === selected ? "selected" : ""}>${esc(label)}</option>`).join("");
+  }
+
+  async function viewBatches() {
+    setNav("batches");
+    stopPolling();
+    const data = await api("/batches");
+    app.innerHTML = `
+      <h1>Batches</h1>
+      <p class="muted">A batch applies one set of clip settings to many videos. Upload or link them, set the settings once, and each video is processed as soon as its transcript is ready.</p>
+      <form id="batchForm" class="panel row">
+        <input id="batchName" placeholder="Batch name, for example: Season 2 episodes" maxlength="120" style="flex:1;min-width:220px">
+        <button type="submit">Create batch</button>
+      </form>
+      <div class="grid" style="margin-top:16px">
+        ${data.batches.map((b) => `
+          <a class="panel" style="text-decoration:none;color:inherit" href="#/batch/${esc(b.id)}">
+            <strong>${esc(b.name)}</strong>
+            <div class="small muted">${b.projects} videos · ${b.settings ? "settings saved" : "no settings yet"}</div>
+            <div class="small muted">${Object.entries(b.status_counts).map(([k, v]) => `${esc(STATUS_LABEL[k] || k)}: ${v}`).join(" · ") || "Empty"}</div>
+          </a>`).join("") || "<p class='muted'>No batches yet.</p>"}
+      </div>`;
+    document.getElementById("batchForm").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      try {
+        const b = await api("/batches", { method: "POST", json: { name: document.getElementById("batchName").value } });
+        location.hash = "#/batch/" + b.id;
+      } catch (err) { toast(err.message); }
+    });
+  }
+
+  async function viewBatch(id) {
+    setNav("batches");
+    stopPolling();
+    const [batch, s, themes] = await Promise.all([
+      api("/batches/" + encodeURIComponent(id)), api("/settings"), api("/themes"),
+    ]);
+    const cur = batch.settings || {};
+    const v = s.values;
+    const items = (batch.items || []).map((p) => `
+      <tr><td><a href="#/project/${esc(p.id)}">${esc(p.title)}</a></td><td>${statusBadge(p.status)}</td>
+      <td class="small muted">${esc(p.status_message || "")}</td></tr>`).join("");
+
+    app.innerHTML = `
+      <h1>${esc(batch.name)}</h1>
+      <section class="panel stack">
+        <h2>Add videos</h2>
+        <div class="grid">
+          <div><label for="b_files">Upload videos (MP4, MOV, WEBM, MKV)</label><input id="b_files" type="file" multiple accept=".mp4,.mov,.webm,.mkv,video/*"></div>
+          <div><label for="b_links">Or paste links, one per line</label><textarea id="b_links" rows="3" placeholder="https://example.com/video1.mp4"></textarea></div>
+        </div>
+        <label class="check"><input id="b_rights" type="checkbox"> I own these videos or have permission to process them.</label>
+        <div class="row"><button id="addBtn">Add to batch</button><span id="addStatus" class="small muted"></span></div>
+      </section>
+
+      <form id="batchSettingsForm" class="panel stack">
+        <h2>Clip settings for every video</h2>
+        <div class="grid">
+          <div><label for="bs_theme">Theme</label>
+            <select id="bs_theme">${themes.themes.map((t) => `<option ${t === (cur.theme || v.default_theme) ? "selected" : ""}>${esc(t)}</option>`).join("")}</select></div>
+          <div><label for="bs_len">Clip length (seconds)</label><input id="bs_len" type="number" min="1" value="${esc(cur.clip_length || v.default_clip_length)}" required></div>
+          <div><label for="bs_count">Clips per video</label><input id="bs_count" type="number" min="1" max="20" value="${esc(cur.clip_count || v.default_clip_count)}" required></div>
+          <div><label for="bs_orient">Orientation</label><select id="bs_orient">${optionList(ORIENTATION_OPTIONS, cur.orientation || v.default_orientation)}</select></div>
+          <div><label for="bs_res">Resolution</label><select id="bs_res">
+            <option value="1080p" ${(cur.resolution || v.default_resolution) === "1080p" ? "selected" : ""}>1080p</option>
+            <option value="720p" ${(cur.resolution || v.default_resolution) === "720p" ? "selected" : ""}>720p</option></select></div>
+          <div><label for="bs_caps">Captions</label><select id="bs_caps">${optionList(CAPTION_OPTIONS, cur.captions_style || v.default_captions_style)}</select></div>
+        </div>
+        <label class="check"><input id="bs_mirror" type="checkbox" ${cur.mirror ? "checked" : ""}> Mirror the video</label>
+        <div class="row">
+          <button type="submit">Save and generate for every ready video</button>
+          <span class="small muted">Videos still transcribing will start as soon as they are ready.</span>
+        </div>
+      </form>
+
+      <section class="panel">
+        <div class="row" style="justify-content:space-between"><h2 style="margin:0">Videos</h2>
+          <button class="danger secondary" id="deleteBatchBtn">Delete batch</button></div>
+        <div style="overflow-x:auto;margin-top:10px"><table><thead><tr><th>Video</th><th>Status</th><th>Detail</th></tr></thead>
+          <tbody>${items || "<tr><td colspan='3' class='muted'>No videos yet.</td></tr>"}</tbody></table></div>
+      </section>`;
+
+    document.getElementById("addBtn").addEventListener("click", async () => {
+      if (!document.getElementById("b_rights").checked) { toast("Please confirm you have the rights to these videos."); return; }
+      const files = Array.from(document.getElementById("b_files").files);
+      const links = document.getElementById("b_links").value.split("\n").map((l) => l.trim()).filter(Boolean);
+      if (!files.length && !links.length) { toast("Choose files or paste links."); return; }
+      const status = document.getElementById("addStatus");
+      let added = 0;
+      for (const file of files) {
+        status.textContent = `Uploading ${added + 1} of ${files.length + links.length}...`;
+        const form = new FormData();
+        form.append("file", file); form.append("batch_id", id); form.append("title", file.name.replace(/\.[^.]+$/, ""));
+        try { await api("/projects", { method: "POST", body: form }); added++; } catch (err) { toast(err.message); }
+      }
+      for (const link of links) {
+        const form = new FormData();
+        form.append("url", link); form.append("batch_id", id);
+        try { await api("/projects", { method: "POST", body: form }); added++; } catch (err) { toast(err.message); }
+      }
+      status.textContent = `${added} added.`;
+      viewBatch(id);
+    });
+
+    document.getElementById("batchSettingsForm").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      try {
+        const r = await api(`/batches/${encodeURIComponent(id)}/settings`, { method: "PUT", json: {
+          theme: document.getElementById("bs_theme").value,
+          clip_length: Number(document.getElementById("bs_len").value),
+          clip_count: Number(document.getElementById("bs_count").value),
+          orientation: document.getElementById("bs_orient").value,
+          resolution: document.getElementById("bs_res").value,
+          captions_style: document.getElementById("bs_caps").value,
+          mirror: document.getElementById("bs_mirror").checked,
+        }});
+        toast(`Started for ${r.applied} videos${r.waiting ? `, ${r.waiting} will start when ready` : ""}${r.errors.length ? `. ${r.errors.length} could not start: ${r.errors[0]}` : ""}`);
+        viewBatch(id);
+      } catch (err) { toast(err.message); }
+    });
+
+    document.getElementById("deleteBatchBtn").addEventListener("click", async () => {
+      if (!confirm("Delete this batch? Its videos stay in your projects.")) return;
+      try { await api(`/batches/${encodeURIComponent(id)}`, { method: "DELETE" }); location.hash = "#/batches"; }
+      catch (err) { toast(err.message); }
+    });
+
+    if ((batch.items || []).some((p) => ["queued", "acquiring", "preparing_audio", "transcribing", "planning", "rendering"].includes(p.status))) {
+      pollTimer = setInterval(() => viewBatch(id), 4000);
+    }
+  }
+
+  // -- analytics -------------------------------------------------------------------
+  async function viewAnalytics() {
+    setNav("analytics");
+    stopPolling();
+    const a = await api("/analytics");
+    const row = (label, stats) => `<tr><td>${esc(label)}</td><td>${stats.clips}</td>
+      <td>${stats.avg_views == null ? "-" : esc(stats.avg_views)}</td><td>${stats.avg_likes == null ? "-" : esc(stats.avg_likes)}</td></tr>`;
+    const block = (title, map) => `
+      <section class="panel"><h2>${esc(title)}</h2>
+        <div style="overflow-x:auto"><table><thead><tr><th></th><th>Clips</th><th>Avg views</th><th>Avg likes</th></tr></thead>
+        <tbody>${Object.entries(map).map(([k, v]) => row(k, v)).join("")}</tbody></table></div></section>`;
+
+    app.innerHTML = `
+      <h1>Analytics</h1>
+      <p class="muted">Enter views and likes on each clip (on its project page). The averages below show which kinds of clips do best.</p>
+      <div class="grid">
+        <div class="panel"><div class="small muted">Clips with results</div><div style="font-size:1.4rem;font-weight:700">${a.clips_with_metrics} of ${a.clips_total}</div></div>
+        <div class="panel"><div class="small muted">Average views</div><div style="font-size:1.4rem;font-weight:700">${a.overall.avg_views == null ? "-" : esc(a.overall.avg_views)}</div></div>
+      </div>
+      ${a.clips_with_metrics ? `
+        ${block("By score", a.by_score)}
+        ${block("By length", a.by_length)}
+        ${block("By theme", a.by_theme)}
+        ${block("With or without effects", { "With effects": a.with_effects, "Without effects": a.without_effects })}
+        <section class="panel"><h2>Top clips</h2>
+          <ol>${a.top_clips.map((c) => `<li><strong>${esc(c.views)} views</strong> · ${esc(c.likes || 0)} likes · score ${c.score == null ? "-" : c.score.toFixed(2)}<div class="small muted">${esc(c.title)} — ${esc(c.reason || "")}</div></li>`).join("")}</ol>
+        </section>` : "<div class='panel'><p>No results yet. Add views to a few clips to see patterns.</p></div>"}`;
+  }
+
   // -- router --------------------------------------------------------------------
   async function route() {
     renderNav();
@@ -662,6 +859,9 @@
       if (hash.startsWith("#/project/")) return await viewProject(decodeURIComponent(hash.slice("#/project/".length)));
       if (hash === "#/new") return await viewNew();
       if (hash === "#/setup") return await viewSetup();
+      if (hash === "#/batches") return await viewBatches();
+      if (hash.startsWith("#/batch/")) return await viewBatch(decodeURIComponent(hash.slice("#/batch/".length)));
+      if (hash === "#/analytics") return await viewAnalytics();
       if (hash === "#/account") return viewAccount();
       if (hash === "#/admin") return await viewAdmin();
       stopPolling();

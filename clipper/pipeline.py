@@ -185,6 +185,24 @@ def handle_transcribe(svc: Services, job: dict) -> None:
         status_message="Transcript ready. Choose a theme and clip settings.",
     )
     audio.unlink(missing_ok=True)  # the extracted audio is temporary
+    _apply_batch_settings(svc, pid)
+
+
+def _apply_batch_settings(svc: Services, project_id: str) -> None:
+    """If the project belongs to a batch that already has settings, start generating now."""
+    from .services import start_generation
+
+    project = _project(svc, project_id)
+    if not project.get("batch_id"):
+        return
+    batch = svc.db.one("SELECT settings_json FROM batches WHERE id = ?", (project["batch_id"],))
+    opts = loads(batch["settings_json"], None) if batch else None
+    if not opts:
+        return
+    try:
+        start_generation(svc, project, opts)
+    except ValueError as exc:
+        svc.set_project(project_id, status_message=f"Transcript ready. Batch settings were not applied: {exc}")
 
 
 def handle_plan(svc: Services, job: dict) -> None:

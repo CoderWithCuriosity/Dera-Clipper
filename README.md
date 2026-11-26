@@ -71,6 +71,14 @@ To create placeholder effects for testing: `python scripts/make_placeholder_effe
 
 Placements from the language model are checked: they must name a real effect, sit on a sentence end or pause, stay at least two seconds apart, and fit the clip. Sound is ducked automatically while someone speaks. If no model answers, effects are placed randomly at sentence ends, up to the per-clip limit (`CLIPPER_MAX_EFFECTS_PER_CLIP`, default 4).
 
+## Clips, captions, and results
+
+- **Orientation:** landscape 16:9, vertical 9:16 (Shorts, Reels, TikTok), or square 1:1. The frame is centre-cropped from the source. Resolution is 1080p or 720p.
+- **Caption styles:** classic, bold, boxed, karaoke (each word highlights as it is spoken), or none.
+- **Regenerate one clip** with a different caption style, orientation, or mirror setting, without redoing the others.
+- **Results and analytics:** enter views and likes on each clip. The Analytics page shows average views by score band, length, theme, and whether the clip had effects, plus the top five clips.
+- **Batches:** create a batch, save one set of clip settings, then upload or link many videos. Each video starts as soon as its transcript is ready. A video that is too short for the clip length is reported instead of failing silently.
+
 ## Multi-user accounts
 
 In `vps` and `aws` modes, sign-in is on. The first account you create becomes the administrator. Set `CLIPPER_ADMIN_EMAIL` to choose the administrator by email instead, and `CLIPPER_ALLOW_REGISTRATION=false` to close sign-up after your accounts are made.
@@ -108,7 +116,7 @@ Edit `/etc/clipper/clipper.env` and set `CLIPPER_MASTER_KEY`. Then install `depl
 
 ## What has been tested
 
-- Unit and end-to-end tests with real FFmpeg renders: 65 tests, run with `python -m pytest`.
+- Unit and end-to-end tests with real FFmpeg renders: 76 tests, run with `python -m pytest` (one PostgreSQL test is skipped until a scratch database is provided).
 - Real speech transcribed with local Whisper (`tiny`), then a vertical clip rendered, checked end to end.
 - S3 storage and the full pipeline on S3, using a mocked S3 (moto).
 - Not verified against live services in this environment: PostgreSQL (the code path exists and runs when `CLIPPER_TEST_PG_URL` points at a scratch database), real AWS Transcribe (the result parser is tested on a sample document), real cloud LLM and Whisper APIs (adapters are tested with mocked HTTP), and the Docker image build.

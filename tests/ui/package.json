@@ -1,0 +1,12 @@
+{
+  "name": "clipper-ui-smoke",
+  "private": true,
+  "description": "Browser-environment smoke tests for the AI Clipper interface. Not run by pytest.",
+  "scripts": {
+    "smoke": "node smoke.js",
+    "auth-smoke": "node auth-smoke.js"
+  },
+  "devDependencies": {
+    "jsdom": "^24.0.0"
+  }
+}

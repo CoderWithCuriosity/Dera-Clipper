@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS batches (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
     name TEXT NOT NULL,
+    settings_json TEXT,            -- clip settings applied to every project in the batch
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS projects (
