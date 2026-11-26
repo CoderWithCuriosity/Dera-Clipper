@@ -3,29 +3,50 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#6366f1">
   <title>AI Clipper</title>
-  <link rel="icon" href="data:,">
-  <link rel="stylesheet" href="/style.css">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%236366f1'/%3E%3Cpath d='M9 7l8 5-8 5z' fill='white'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="/assets/app.css">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="#/projects">AI Clipper</a>
-    <nav>
-      <a href="#/projects" data-nav="projects">Projects</a>
-      <a href="#/new" data-nav="new">New project</a>
-      <a href="#/batches" data-nav="batches">Batches</a>
-      <a href="#/analytics" data-nav="analytics">Analytics</a>
-      <a href="#/setup" data-nav="setup">Setup</a>
-      <a href="#/admin" data-nav="admin" data-admin-only hidden>Admin</a>
-      <a href="#/account" data-nav="account" data-signed-in hidden>Account</a>
+    <a class="brand" href="#/projects" aria-label="AI Clipper home">
+      <span class="brand-mark" aria-hidden="true">
+        <svg class="i" viewBox="0 0 24 24" style="width:18px;height:18px;stroke:#fff;fill:#fff;stroke-width:0"><path d="M8 5.5v13a1 1 0 0 0 1.5.86l10.5-6.5a1 1 0 0 0 0-1.72L9.5 4.64A1 1 0 0 0 8 5.5Z"/></svg>
+      </span>
+      <span>Clipper</span>
+    </a>
+    <nav class="nav" id="mainNav" aria-label="Main">
+      <a href="#/projects" data-nav="projects">
+        <svg class="i" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 4v16M17 4v16M3 9h4M3 15h4M17 9h4M17 15h4"/></svg>Projects</a>
+      <a href="#/new" data-nav="new">
+        <svg class="i" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>New</a>
+      <a href="#/batches" data-nav="batches">
+        <svg class="i" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="7" rx="1.5"/></svg>Batches</a>
+      <a href="#/analytics" data-nav="analytics">
+        <svg class="i" viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M3 20h18"/></svg>Analytics</a>
+      <a href="#/library" data-nav="library" data-admin-only hidden>
+        <svg class="i" viewBox="0 0 24 24"><path d="M12 3 2 8l10 5 10-5-10-5Z"/><path d="m2 13 10 5 10-5"/></svg>Library</a>
+      <a href="#/setup" data-nav="setup">
+        <svg class="i" viewBox="0 0 24 24"><path d="M4 6h8M16 6h4M4 12h4M12 12h8M4 18h10M18 18h2"/><circle cx="14" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="16" cy="18" r="2"/></svg>Setup</a>
+      <a href="#/admin" data-nav="admin" data-admin-only hidden>
+        <svg class="i" viewBox="0 0 24 24"><path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6l-8-3Z"/></svg>Admin</a>
+      <a href="#/account" data-nav="account" data-signed-in hidden>
+        <svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21c1.5-4 4.5-6 8-6s6.5 2 8 6"/></svg>Account</a>
     </nav>
-    <div class="row" style="gap:10px">
-      <span id="who" class="small muted"></span>
-      <button id="signOut" class="secondary" data-signed-in hidden>Sign out</button>
+    <div class="topbar-end">
+      <span id="who" class="chip"></span>
+      <button id="themeToggle" class="icon-btn" type="button" aria-label="Switch theme"></button>
+      <button id="signOut" class="icon-btn" type="button" data-signed-in hidden aria-label="Sign out" title="Sign out">
+        <svg class="i" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg>
+      </button>
     </div>
   </header>
   <main id="app" class="container" aria-live="polite"></main>
   <div id="toast" class="toast" role="status" hidden></div>
-  <script src="/app.js"></script>
+  <script src="/assets/app.js"></script>
 </body>
 </html>

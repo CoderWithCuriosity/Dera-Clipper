@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import effects
+from . import effects, library
 from .auth import (
     AuthError, RateLimiter, check_password_rules, hash_password, issue_access_token, issue_media_token,
     issue_refresh_token, read_access_token, read_media_token, revoke_all, rotate_refresh_token, verify_password,
@@ -117,6 +117,11 @@ class BatchIn(BaseModel):
     name: str = Field(min_length=1, max_length=120)
 
 
+class ThemeIn(BaseModel):
+    name: str = Field(min_length=2, max_length=60)
+    description: str = Field(default="", max_length=300)
+
+
 class AdminUserPatch(BaseModel):
     role: Optional[str] = None
     disabled: Optional[bool] = None
@@ -211,6 +216,11 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
 
     clip_media_dep = Depends(clip_media_user)
     project_media_dep = Depends(project_media_user)
+
+    def effect_media_user(request: Request, effect_id: str) -> dict:
+        return _media_user(request, f"effect:{effect_id}")
+
+    effect_media_dep = Depends(effect_media_user)
     svc_dep = Depends(get_svc)
 
     # -- accounts ------------------------------------------------------------------
@@ -426,14 +436,89 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
 
     # -- effects -------------------------------------------------------------------
     @app.get("/api/effects")
-    def list_effects(s: Services = svc_dep) -> dict:
+    def list_effects(user: dict = user_dep, s: Services = svc_dep) -> dict:
+        folders = library.theme_folder_names(settings)
         themes = []
         for name in effects.list_themes(s):
             rows = s.db.all("SELECT id, kind, file_name, duration, tags_json, license FROM effects WHERE theme = ? ORDER BY id", (name,))
-            themes.append({"name": name, "count": len(rows), "effects": [
-                {"id": r["id"], "kind": r["kind"], "file": r["file_name"], "duration": r["duration"],
-                 "tags": loads(r["tags_json"], []), "license": r["license"]} for r in rows]})
+            themes.append({
+                "name": name,
+                "folder": folders.get(name),
+                "count": len(rows),
+                "effects": [
+                    {"id": r["id"], "kind": r["kind"], "file": r["file_name"], "duration": r["duration"],
+                     "tags": loads(r["tags_json"], []), "license": r["license"],
+                     "url": _media_link(s, user["id"], f"effect:{r['id']}", f"/api/effects/{r['id']}/file")}
+                    for r in rows
+                ],
+            })
         return {"themes": themes, "max_effects_per_clip": settings.max_effects_per_clip}
+
+    @app.get("/api/effects/{effect_id:path}/file")
+    def effect_file(effect_id: str, user: dict = effect_media_dep, s: Services = svc_dep):
+        row = s.db.one("SELECT * FROM effects WHERE id = ?", (effect_id,))
+        if row is None:
+            raise HTTPException(404, "Not found")
+        local = settings.effects_dir.joinpath(*row["storage_key"].split("/")[1:])
+        if not local.is_file():
+            try:
+                local = s.storage.local_path(row["storage_key"])
+            except FileNotFoundError:
+                raise HTTPException(404, "The file is missing")
+        return FileResponse(local, filename=Path(row["file_name"]).name)
+
+    # -- library management (admin, from the website) ------------------------------
+    @app.post("/api/admin/themes", status_code=201)
+    def admin_create_theme(body: ThemeIn, _admin: dict = admin_dep, s: Services = svc_dep) -> dict:
+        try:
+            theme = library.create_theme(settings, body.name, body.description)
+        except library.LibraryError as exc:
+            raise HTTPException(400, str(exc))
+        effects.rescan(s)
+        return theme
+
+    @app.delete("/api/admin/themes/{folder}")
+    def admin_delete_theme(folder: str, _admin: dict = admin_dep, s: Services = svc_dep) -> dict:
+        try:
+            library.delete_theme(settings, folder)
+        except library.LibraryError as exc:
+            raise HTTPException(404, str(exc))
+        effects.rescan(s)
+        return {"deleted": True}
+
+    @app.post("/api/admin/themes/{folder}/effects", status_code=201)
+    def admin_add_effect(
+        folder: str,
+        file: UploadFile = File(...),
+        kind: str = Form(...),
+        name: str = Form(""),
+        tags: str = Form(""),
+        license: str = Form(""),
+        source: str = Form(""),
+        speech: bool = Form(False),
+        _admin: dict = admin_dep,
+        s: Services = svc_dep,
+    ) -> dict:
+        data = file.file.read(library.MAX_UPLOAD_BYTES + 1)
+        try:
+            entry = library.add_effect(
+                settings, folder, file.filename or "", data, kind=kind, name=name,
+                tags=[t for t in tags.split(",")], license_text=license, source=source, speech=speech,
+                probe=library.find_ffmpeg_probe(s),
+            )
+        except library.LibraryError as exc:
+            raise HTTPException(400, str(exc))
+        effects.rescan(s)
+        return entry
+
+    @app.delete("/api/admin/themes/{folder}/effects")
+    def admin_remove_effect(folder: str, file: str, _admin: dict = admin_dep, s: Services = svc_dep) -> dict:
+        try:
+            library.remove_effect(settings, folder, file)
+        except library.LibraryError as exc:
+            raise HTTPException(404, str(exc))
+        effects.rescan(s)
+        return {"deleted": True}
 
     @app.post("/api/effects/rescan")
     def rescan_effects(_admin: dict = admin_dep, s: Services = svc_dep) -> dict:

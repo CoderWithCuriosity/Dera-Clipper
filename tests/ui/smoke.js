@@ -68,6 +68,7 @@ async function waitFor(path, predicate, timeoutMs = 120000) {
     ["#/batches", "Batches"],
     [`#/batch/${batch.id}`, "Smoke batch"],
     [`#/project/${project.id}`, "speech"],
+    ["#/library", "Effect library"],
     ["#/admin", "Administration"],
     ["#/account", "Account"],
   ];
