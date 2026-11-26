@@ -434,7 +434,7 @@ def create_app(settings: Optional[Settings] = None, start_worker: Optional[bool]
             raise HTTPException(404, "No logo uploaded yet")
         # Browsers must check again each time, so a replaced logo is never shown from an old copy.
         return FileResponse(s.storage.local_path(logo_key(user["id"])), media_type="image/png",
-                            headers={"Cache-Control": "no-cache"})
+                            headers={"Cache-Control": "no-store"})
 
     @app.post("/api/logo", status_code=201)
     def upload_logo(file: UploadFile = File(...), user: dict = user_dep, s: Services = svc_dep) -> dict:

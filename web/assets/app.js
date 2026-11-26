@@ -596,7 +596,7 @@
 
       if (project.has_transcript) {
         wireMix("g");
-        wireLogo("g", !!logoRes.logo);
+        wireLogo("g", logoRes.logo);
         document.getElementById("genForm").addEventListener("submit", async (ev) => {
           ev.preventDefault();
           try {
@@ -669,15 +669,21 @@
     bl: ["Bottom left", 3, 97], bc: ["Bottom centre", 50, 97], br: ["Bottom right", 97, 97],
   };
   const FRAME_ASPECT = { landscape: 16 / 9, vertical: 9 / 16, square: 1 };
-  let logoUrl = null; // object URL for the saved logo, fetched once and reused
+  // The logo is keyed by its upload time. A new upload gives a new address, so no copy from
+  // an earlier upload (in memory, in the browser cache, or on a server cache) can be shown.
+  let logoShown = { version: null, url: null };
 
-  async function logoImageUrl() {
-    if (logoUrl) return logoUrl;
+  async function logoImageUrl(info) {
+    const version = (info && info.uploaded_at) || "";
+    if (logoShown.url && logoShown.version === version) return logoShown.url;
     const headers = session.token ? { Authorization: "Bearer " + session.token } : {};
-    const res = await fetch("/api/logo/image", { headers, credentials: "same-origin", cache: "no-cache" });
+    const res = await fetch(`/api/logo/image?v=${encodeURIComponent(version)}`,
+      { headers, credentials: "same-origin", cache: "no-store" });
     if (!res.ok) return null;
-    logoUrl = URL.createObjectURL(await res.blob());
-    return logoUrl;
+    const url = URL.createObjectURL(await res.blob());
+    if (logoShown.url) URL.revokeObjectURL(logoShown.url);
+    logoShown = { version, url };
+    return url;
   }
 
   // The logo controls with a live preview of the frame. p keeps element ids unique on each page.
@@ -742,7 +748,7 @@
     mark.style.opacity = String(get("opacity") / 100);
   }
 
-  async function wireLogo(p, hasLogo) {
+  async function wireLogo(p, logoInfo) {
     const repaint = () => paintLogo(p);
     ["x", "y", "size", "opacity"].forEach((key) => document.getElementById(`${p}_${key}`).addEventListener("input", repaint));
     app.querySelectorAll(`[data-spot][data-prefix="${p}"]`).forEach((btn) => btn.addEventListener("click", () => {
@@ -754,10 +760,10 @@
     const from = document.getElementById(p + "_stage").dataset.orientFrom;
     const orient = from ? document.querySelector(from) : null;
     if (orient) orient.addEventListener("change", repaint);
-    if (hasLogo) {
+    if (logoInfo) {
       const img = document.getElementById(p + "_img");
       img.addEventListener("load", () => { img.dataset.ratio = img.naturalHeight / img.naturalWidth; repaint(); });
-      const url = await logoImageUrl();
+      const url = await logoImageUrl(logoInfo);
       if (url && document.getElementById(p + "_img")) document.getElementById(p + "_img").src = url;
     }
     repaint();
@@ -901,7 +907,7 @@
     });
 
     wireMix("bs");
-    wireLogo("bs", !!logoRes.logo);
+    wireLogo("bs", logoRes.logo);
     document.getElementById("batchSettingsForm").addEventListener("submit", async (ev) => {
       ev.preventDefault();
       try {
@@ -1266,7 +1272,7 @@
     // Brand logo: upload, remove, and save the placement defaults.
     wireDropzone(document.getElementById("dropLogo"));
     wireMix("d");
-    wireLogo("dl", !!logo);
+    wireLogo("dl", logo);
     document.getElementById("logoUpload").addEventListener("click", async () => {
       const f = document.getElementById("logoFile").files[0];
       if (!f) { toast("Choose an image first"); return; }
@@ -1274,7 +1280,6 @@
       form.append("file", f);
       try {
         await api("/logo", { method: "POST", body: form });
-        logoUrl = null;
         toast("Logo saved");
         viewSetup();
       } catch (err) { toast(err.message); }
@@ -1283,7 +1288,6 @@
       if (!confirm("Remove your logo? Clips made later will not have it.")) return;
       try {
         await api("/logo", { method: "DELETE" });
-        logoUrl = null;
         toast("Logo removed");
         viewSetup();
       } catch (err) { toast(err.message); }
