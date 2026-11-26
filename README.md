@@ -125,6 +125,7 @@ Edit `/etc/clipper/clipper.env` and set `CLIPPER_MASTER_KEY`. Then install `depl
 
 ```bash
 pip install pytest
+python scripts/make_placeholder_effects.py   # creates the placeholder sound and B-roll files (git-ignored)
 python -m pytest
 ```
 
