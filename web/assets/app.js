@@ -166,6 +166,8 @@
     const locked = session.authRequired && !signedIn;
     const mainNav = document.getElementById("mainNav");
     if (mainNav) mainNav.hidden = locked;
+    const menuBtn = document.getElementById("menuToggle");
+    if (menuBtn) menuBtn.hidden = locked;
     const who = document.getElementById("who");
     if (who) {
       who.hidden = locked;
@@ -211,6 +213,30 @@
         input.files = e.dataTransfer.files;
         show();
       }
+    });
+  }
+
+  // -- mobile menu -----------------------------------------------------------
+  function closeMenu() {
+    const nav = document.getElementById("mainNav");
+    const btn = document.getElementById("menuToggle");
+    if (nav) nav.classList.remove("open");
+    if (btn) { btn.setAttribute("aria-expanded", "false"); btn.setAttribute("aria-label", "Open menu"); }
+  }
+
+  function initMenu() {
+    const btn = document.getElementById("menuToggle");
+    const nav = document.getElementById("mainNav");
+    btn.addEventListener("click", () => {
+      const open = !nav.classList.contains("open");
+      nav.classList.toggle("open", open);
+      btn.setAttribute("aria-expanded", String(open));
+      btn.setAttribute("aria-label", open ? "Close menu" : "Open menu");
+    });
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeMenu(); });
+    document.addEventListener("click", (e) => {
+      if (!nav.classList.contains("open")) return;
+      if (!nav.contains(e.target) && !btn.contains(e.target)) closeMenu();
     });
   }
 
@@ -340,8 +366,8 @@
     list.innerHTML = `<div class="grid">${projects.map((p) => `
       <a class="card card-link" href="#/project/${esc(p.id)}">
         <div class="card-head">
-          <div class="row" style="gap:12px;min-width:0"><div class="bubble">${icon("film")}</div>
-            <div style="min-width:0"><h3 style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.title)}</h3>
+          <div class="row grow" style="gap:12px"><div class="bubble">${icon("film")}</div>
+            <div class="grow-text"><h3 class="clamp-2">${esc(p.title)}</h3>
             <div class="desc small muted">${fmtDuration(p.duration)} · ${p.source_type === "link" ? "Link" : "Upload"} · ${fmtDate(p.created_at)}</div></div>
           </div>
           ${statusBadge(p.status)}
@@ -1171,8 +1197,9 @@
       session.user = null;
     }
     if (!session.authRequired) renderNav();
-    window.addEventListener("hashchange", route);
+    window.addEventListener("hashchange", () => { closeMenu(); route(); });
     document.getElementById("signOut").addEventListener("click", signOut);
+    initMenu();
     route();
   }
 
